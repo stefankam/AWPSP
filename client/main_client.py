@@ -113,6 +113,7 @@ def train():
 
         # Parse sync_only flag
 #        sync_only = request.form.get("sync_only", "False") == "True"
+        logical_id = request.form.get("logical_id")
 
 #        if sync_only:
 #            print("📥 Received weights (sync_only=True), skipping training")
@@ -121,7 +122,8 @@ def train():
         # Perform training
         updated_weights = topology.run_local_training(
                 global_weights=state_dict,
-                local_epochs=3
+                local_epochs=3,
+                logical_id=logical_id
             )
         trace.advance()  # ⬅️ Move to next trace after training
         print("✅ Training completed. Advanced trace.")

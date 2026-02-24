@@ -1,3 +1,4 @@
+
 # topology_server.py
 
 import sys
@@ -9,6 +10,7 @@ import threading
 import copy
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import hashlib
 from collections import defaultdict
@@ -202,7 +204,7 @@ class TopologyProvider:
 
 
 
-    def send_weights_to_client(self, device_id, global_weights, max_retries=50):
+    def send_weights_to_client(self, device_id, global_weights, max_retries=50, sync_only=False, logical_id=None):
         # Get IP and port of the device
         entry = self.device_registry[device_id]
         ip = entry["ip"]
@@ -221,6 +223,11 @@ class TopologyProvider:
                buffer.seek(0)
                files = {"weights": ("model.pth", buffer)}
 
+               # Send sync_only flag so client can decide whether to train
+               data = {"sync_only": sync_only}
+               if logical_id is not None:
+                  data["logical_id"] = logical_id
+
                response = requests.post(url, files=files, timeout=5000)
 
                if response.status_code == 200:
@@ -235,6 +242,46 @@ class TopologyProvider:
         return None
 
 
+    def run_logical_federated_round(self, logical_ids, physical_ids, global_weights, per_client_timeout=30):
+        updated_weights = []
+        if not physical_ids:
+            return None
+
+        def train_logical_on_physical(logical_id, physical_id):
+            print(f"Sending logical client {logical_id} to physical {physical_id}")
+            start_time = time.time()
+            client_weights = None
+            while time.time() - start_time < per_client_timeout:
+                client_weights = self.send_weights_to_client(
+                    physical_id,
+                    global_weights,
+                    sync_only=False,
+                    logical_id=logical_id,
+                )
+                if client_weights is not None:
+                    return (client_weights, 1.0)
+                time.sleep(0.5)
+            print(f"   ^z^o Logical client {logical_id} via {physical_id} did not respond.")
+            return None
+
+        wave_size = len(physical_ids)
+        for wave_start in range(0, len(logical_ids), wave_size):
+            wave = logical_ids[wave_start:wave_start + wave_size]
+            with ThreadPoolExecutor(max_workers=wave_size) as executor:
+                futures = []
+                for idx, logical_id in enumerate(wave):
+                    physical_id = physical_ids[idx % wave_size]
+                    futures.append(executor.submit(train_logical_on_physical, logical_id, physical_id))
+
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        updated_weights.append(result)
+
+        return self.aggregate_weights(updated_weights)
+
+
+
     def resolve_pod_url(self, node_name):
         namespace = "fl-simulation"
         pod_dns = f"http://{node_name}.{namespace}.svc.cluster.local:5000/train"
@@ -244,25 +291,54 @@ class TopologyProvider:
     def run_federated_round(self, selected_hosts, global_weights, model=None):
         updated_weights = []
         print("selected_hosts: ", selected_hosts)
-        for worker_name in selected_hosts:
-            print("Sending weights to:", worker_name)
-            client_weights = self.send_weights_to_client(worker_name, global_weights)
-            updated_weights.append(client_weights)
-        return self.aggregate_weights(updated_weights)
+        if use_selected_nodes and selected_nodes:
+            # Keep selected-node global accuracy consistent with per-client aggregation (macro-average).
+            per_client = self.evaluate_per_client_accuracy(model, selected_nodes, use_unseen_test=True)
+            values = [v for v in per_client.values() if v is not None]
+            return (sum(values) / len(values)) if values else 0.0
 
-
-    def aggregate_weights(self, weight_list):
-        if not weight_list:
-           print("⚠️ No weights to aggregate (no clients participated this round).")
+    def aggregate_weights(self, weighted_list):
+        # Filter out None entries
+        weighted_list = [w for w in weighted_list if w is not None]
+        if not weighted_list:
+           print("   ^z         ^o No weights to aggregate (no clients participated this round).")
            return None  # or return last global weights, or reinitialize
-        new_state = copy.deepcopy(weight_list[0])
-        for key in new_state:
-            if torch.is_floating_point(new_state[key]):
-               new_state[key] = sum(w[key] for w in weight_list) / len(weight_list)
+        normalized = []
+        for item in weighted_list:
+            if isinstance(item, tuple) and len(item) == 2:
+                state, factor = item
+                if isinstance(state, tuple) and len(state) == 2 and isinstance(state[0], dict):
+                    state, factor = state
+                normalized.append((state, factor))
             else:
-               # Non-float types (e.g. LongTensor): just copy the first one
-               new_state[key] = weight_list[0][key]
+                normalized.append((item, 1.0))
+        # normalized is [(state_dict, weight_factor), ...]
+        new_state = copy.deepcopy(normalized[0][0])
+
+        for key in new_state:
+           if torch.is_floating_point(new_state[key]):
+              total = 0.0
+              total_weight = 0.0
+              for w, factor in normalized:
+                 total += w[key] * factor
+                 total_weight += factor
+              new_state[key] = total / total_weight if total_weight > 0 else total
+           else:
+              new_state[key] = normalized[0][0][key]
         return new_state  
+
+
+    def get_node_labels(self, node, labels_per_client=2, total_labels=10):
+        labels = self.label_map.get(node)
+        if labels:
+            return labels
+        digits = ''.join(filter(str.isdigit, str(node)))
+        if digits:
+            idx = int(digits)
+            start = (idx * labels_per_client) % total_labels
+            return [((start + j) % total_labels) for j in range(labels_per_client)]
+        return []
+
 
 
     def evaluate_global_model(self, model, selected_nodes=None, subset_size=1000, use_selected_nodes=True):
@@ -270,46 +346,48 @@ class TopologyProvider:
         model.eval()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
+        print("selected_nodes before calculating accuracy: ", selected_nodes)
 
         if use_selected_nodes and selected_nodes:
-            full_dataset = datasets.CIFAR10(root='data/', train=True, download=False, transform=self.transform)
-
-            # Combine subsets from selected nodes
-            combined_datasets = []
-            for node in selected_nodes:
-                subset = torch.utils.data.Subset(full_dataset, self.fixed_indices[node])
-                combined_datasets.append(subset)
-            eval_dataset = ConcatDataset(combined_datasets)
+            print("selected-node global accuracy consistent with per-client aggregation (macro-average)")
+            per_client = self.evaluate_per_client_accuracy(model, selected_nodes, use_unseen_test=True)
+            values = [v for v in per_client.values() if v is not None]
+            print("average per-client accuracy: ", values)
+            return (sum(values) / len(values)) if values else 0.0
         else:
-            eval_dataset = datasets.CIFAR10(root='data/', train=False, download=False, transform=self.transform)
-
-        test_loader = DataLoader(eval_dataset, batch_size=32, shuffle=False)
-
-        with torch.no_grad():
-            for images, labels in test_loader:
-               outputs = model(images)
-               _, predicted = torch.max(outputs, 1)
-               correct += (predicted == labels).sum().item()
-               total += labels.size(0)
-        accuracy = 100 * correct / total
-
-        return accuracy
+            return 0
 
 
-    def evaluate_per_client_accuracy(self, model, nodes):
+
+    def evaluate_per_client_accuracy(self, model, nodes, use_unseen_test=True):
         model.eval()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.to(device)
 
-        full_dataset = datasets.CIFAR10(root='data/', train=True, download=False, transform=self.transform)
+        full_dataset = datasets.CIFAR10(
+            root='data/',
+            train=(not use_unseen_test),
+            download=False,
+            transform=self.transform,
+        )
+        dataset_targets = np.array(full_dataset.targets)
         per_client_acc = {}
 
         with torch.no_grad():
             for node in nodes:
-                indices = self.fixed_indices.get(node, [])
+                if use_unseen_test:
+                    node_labels = self.label_map.get(node, [])
+                    if not node_labels:
+                        per_client_acc[node] = None
+                        continue
+                    indices = np.where(np.isin(dataset_targets, node_labels))[0].tolist()
+                else:
+                    indices = self.fixed_indices.get(node, [])
+
                 if len(indices) == 0:
                     per_client_acc[node] = None
                     continue
+
                 subset = torch.utils.data.Subset(full_dataset, indices)
                 loader = DataLoader(subset, batch_size=32, shuffle=False)
                 correct = total = 0
@@ -321,6 +399,7 @@ class TopologyProvider:
                 per_client_acc[node] = (100 * correct / total) if total else None
 
         return per_client_acc
+
 
     def get_freshness(self, node, current_round):
         """Returns how long since this node was last selected."""
@@ -448,7 +527,7 @@ class TopologyProvider:
 
         #Load custom test subsets per node
         full_test_dataset = datasets.CIFAR10(
-            root='data/', train=True, download=False, transform=self.transform)
+            root='data/', train=False, download=False, transform=self.transform)
 
         node_test_loaders = {}
 
@@ -619,7 +698,7 @@ class TopologyProvider:
 
         # 6. Load custom test subsets per node
         full_test_dataset = datasets.CIFAR10(
-            root='data/', train=True, download=False, transform=self.transform)
+            root='data/', train=False, download=False, transform=self.transform)
 
         node_test_loaders = {}
 
@@ -884,7 +963,7 @@ class TopologyProvider:
         # 6. Load custom test subsets per node
 
         full_test_dataset = datasets.CIFAR10(
-            root='data/', train=True, download=False, transform=self.transform)
+            root='data/', train=False, download=False, transform=self.transform)
 
         node_test_loaders = {}
 

@@ -1,4 +1,4 @@
-# Cumulative Utility Parity for Fair Federated Learning
+# AWPSP for Fair Federated Learning
 
 This repository implements a federated learning simulator with a centralized server coordinator and multiple client workers. The system is designed to study fairness under intermittent client participation using cumulative utility parity.
 

@@ -1,4 +1,4 @@
-# main_server.py
+$# main_server.py
 
 from flask import Flask, request
 import torch
@@ -234,9 +234,9 @@ def run_federated_training():
     if shared_state.topology is None:
         raise RuntimeError("❌ Topology has not been initialized.")
 
-    logical_client_count = 100
-    physical_container_limit = 4
-    logical_selected_per_round = 10
+    logical_client_count = 1000
+    physical_container_limit = 16
+    logical_selected_per_round = 50
     use_logical_scheduling = True
     logical_labels_per_client = 2
     logical_participation_awpsp = defaultdict(int)
@@ -345,7 +345,6 @@ def run_federated_training():
         if round_index is None:
             round_index = current_round
         nodes = list(shared_state.topology.dht.table.keys())
-        print("nodes before calculating evaluate_per_client_accuracy",nodes)
         per_client_acc = shared_state.topology.evaluate_per_client_accuracy(model, nodes)
         acc_values = [val for val in per_client_acc.values() if val is not None]
         if not acc_values:
@@ -419,46 +418,36 @@ def run_federated_training():
         round_start = time.perf_counter()
         sys_start = snapshot_system()
 
+        logical_client_ids = [f"h{i}" for i in range(logical_client_count)]
+        physical_ids = list(device_registry.keys())[:physical_container_limit]
+        if use_logical_scheduling:
+            logical_awpsp_scores = {cid: random.random() for cid in logical_client_ids}
+            logical_psp_scores = {cid: random.random() for cid in logical_client_ids}
+            logical_selected_fair = sorted(
+                logical_awpsp_scores, key=logical_awpsp_scores.get, reverse=True
+            )[:logical_selected_per_round]
+            logical_selected_awpsp = logical_selected_fair
+            logical_selected_psp = sorted(
+                logical_psp_scores, key=logical_psp_scores.get, reverse=True
+            )[:logical_selected_per_round]
+            logical_metrics_awpsp = compute_logical_label_metrics(logical_selected_awpsp)
+            logical_metrics_psp = compute_logical_label_metrics(logical_selected_psp)
+
 
         # Detect correlated failures
         correlated_failures = shared_state.topology.get_correlated_failure(
             current_round, availability_vectors, corr_threshold=0.35, num_neighbors=4
         )
-
-        logical_client_ids = [f"h{i}" for i in range(logical_client_count)]
-        physical_ids = list(device_registry.keys())[:physical_container_limit]
-        if use_logical_scheduling:
-            # AW-PSP over logical clients: score all N logical IDs, select top m.
-            logical_awpsp_scores = {
-                cid: (shared_state.topology.availability_predictor.predict(cid) + ((hash(cid) % 1000) / 1_000_000.0))
-                for cid in logical_client_ids
-            }
-            logical_selected_awpsp = sorted(
-                logical_client_ids,
-                key=lambda cid: logical_awpsp_scores[cid],
-                reverse=True,
-            )[:logical_selected_per_round]
-
-            # PSP logical baseline
-            logical_selected_psp = random.sample(
-                logical_client_ids,
-                min(logical_selected_per_round, len(logical_client_ids)),
-            )
-
-            logical_selected_fair = logical_selected_awpsp
-            logical_metrics_awpsp = compute_logical_label_metrics(logical_selected_awpsp)
-            logical_metrics_psp = compute_logical_label_metrics(logical_selected_psp)
-
         num_corr_failed = sum(1 for _, failed_neighbors in correlated_failures if failed_neighbors)
         corr_failure_log.append((current_round, num_corr_failed))
         print(f"🌩️ Correlated failure count: {num_corr_failed}")
 
-
         if use_logical_scheduling:
             selected = logical_selected_fair
-            # Keep metrics lightweight in logical mode without changing core AWPSP/PSP implementation
-            var_u = logical_metrics_awpsp["variance"]
-            total_bias_bound = 0.0
+            selected_scores = [logical_awpsp_scores[cid] for cid in selected] if selected else [0.0]
+            score_mean = sum(selected_scores) / len(selected_scores)
+            var_u = sum((s - score_mean) ** 2 for s in selected_scores) / len(selected_scores)
+            total_bias_bound = abs(score_mean - (sum(logical_awpsp_scores.values()) / len(logical_awpsp_scores)))
         else:
             selected, var_u, total_bias_bound = shared_state.topology.select_fair_nodes(
                 base_model,
@@ -480,7 +469,7 @@ def run_federated_training():
         if weights_fair is not None:
            base_model.load_state_dict(weights_fair)
            current_weights_awpsp = weights_fair
-           accuracy = shared_state.topology.evaluate_global_model(base_model, use_selected_nodes=True)
+           accuracy = shared_state.topology.evaluate_global_model(base_model, use_selected_nodes=False)
            accuracy_log.append((current_round, accuracy))
            var_u_log.append((current_round, var_u))
            surrogate_log.append((current_round, total_bias_bound))
@@ -527,7 +516,7 @@ def run_federated_training():
         if weights_awpsp is not None:
            current_weights_awpsp = weights_awpsp
            awpsp_model.load_state_dict(current_weights_awpsp)
-           accuracy_awpsp = shared_state.topology.evaluate_global_model(awpsp_model, selected_nodes=selected_awpsp, use_selected_nodes=True)
+           accuracy_awpsp = shared_state.topology.evaluate_global_model(awpsp_model, selected_nodes=selected_awpsp, use_selected_nodes=False)
            awpsp_accuracy_log.append((current_round, accuracy_awpsp))
            awpsp_instant_fairness_log.append((current_round, awpsp_instant_var))
            awpsp_cumul_fairness_log.append((current_round, awpsp_cumul_var))
@@ -555,7 +544,7 @@ def run_federated_training():
             psp_instant_var = logical_metrics_psp["variance"]
             psp_cumul_var, psp_gini = compute_participation_stats(logical_participation_psp, logical_client_ids)
             psp_covered_labels = logical_metrics_psp["covered_labels"]
-            psp_avg_score = float(len(selected_psp)) / float(max(1, logical_client_count))
+            psp_avg_score = sum(logical_psp_scores[cid] for cid in selected_psp) / len(selected_psp) if selected_psp else 0.0
             psp_labels = logical_metrics_psp["covered_labels"]
             psp_KL = logical_metrics_psp["kl"]
             psp_unseen = logical_metrics_psp["unseen"]
@@ -577,7 +566,7 @@ def run_federated_training():
         if weights_psp is not None:
            current_weights_psp = weights_psp
            psp_model.load_state_dict(current_weights_psp)
-           accuracy_psp = shared_state.topology.evaluate_global_model(psp_model, selected_nodes=selected_psp, use_selected_nodes=True)
+           accuracy_psp = shared_state.topology.evaluate_global_model(psp_model, selected_nodes=selected_psp, use_selected_nodes=False)
            psp_accuracy_log.append((current_round, accuracy_psp))
            psp_instant_fairness_log.append((current_round, psp_instant_var))
            psp_cumul_fairness_log.append((current_round, psp_cumul_var))
@@ -600,10 +589,8 @@ def run_federated_training():
             if current_round == 0:
                 writer.writerow(metrics_header)
 
-            for i in range(num_rounds):
-                print(i, accuracy_log[i][1] if i < len(accuracy_log) else None, var_u_log[i][1] if i < len(var_u_log) else None, surrogate_log[i][1] if i < len(surrogate_log) else None, awpsp_accuracy_log[i][1] if i < len(awpsp_accuracy_log) else None, awpsp_instant_fairness_log[i][1] if i < len(awpsp_instant_fairness_log) else None,  awpsp_cumul_fairness_log[i][1] if i < len(awpsp_cumul_fairness_log) else None, corr_failure_log[i][1] if i < len(corr_failure_log) else None, awpsp_covered_labels_log[i][1] if i < len(awpsp_covered_labels_log) else None, psp_accuracy_log[i][1] if i < len(psp_accuracy_log) else None, psp_instant_fairness_log[i][1] if i < len(psp_instant_fairness_log) else None, psp_cumul_fairness_log[i][1] if i < len(psp_cumul_fairness_log) else None, psp_covered_labels_log[i][1] if i < len(psp_covered_labels_log) else None, selected_awpsp_log[i][1] if i < len(selected_awpsp_log) else None, selected_psp_log[i][1] if i < len(selected_psp_log) else None, awpsp_avg_score_log[i][1] if i < len(awpsp_avg_score_log) else None, psp_avg_score_log[i][1] if i < len(psp_avg_score_log) else None, awpsp_labels_log[i][1] if i < len(awpsp_labels_log) else None, psp_labels_log[i][1] if i < len(psp_labels_log) else None, awpsp_KL_log[i][1] if i < len(awpsp_KL_log) else None, psp_KL_log[i][1] if i < len(psp_KL_log) else None, awpsp_unseen_log[i][1] if i < len(awpsp_unseen_log) else None, psp_unseen_log[i][1] if i < len(psp_unseen_log) else None, awpsp_gini_log[i][1] if i < len(awpsp_gini_log) else None, psp_gini_log[i][1] if i < len(psp_gini_log) else None)
-
             writer.writerow([
+
                 current_round,
                 accuracy_log[-1][1] if accuracy_log else None,
                 var_u_log[-1][1] if var_u_log else None,
