@@ -228,7 +228,7 @@ class TopologyProvider:
                if logical_id is not None:
                   data["logical_id"] = logical_id
 
-               response = requests.post(url, files=files, timeout=5000)
+               response = requests.post(url, data=data, files=files, timeout=5000)
 
                if response.status_code == 200:
                   return torch.load(io.BytesIO(response.content), map_location="cpu")
@@ -341,7 +341,7 @@ class TopologyProvider:
 
 
 
-    def evaluate_global_model(self, model, selected_nodes=None, subset_size=1000, use_selected_nodes=True):
+    def evaluate_global_model(self, model, selected_nodes=None, subset_size=1000, use_selected_nodes=True, physical_ids=None):
         correct = total = 0
         model.eval()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -349,14 +349,41 @@ class TopologyProvider:
         print("selected_nodes before calculating accuracy: ", selected_nodes)
 
         if use_selected_nodes and selected_nodes:
-            print("selected-node global accuracy consistent with per-client aggregation (macro-average)")
-            per_client = self.evaluate_per_client_accuracy(model, selected_nodes, use_unseen_test=True)
+            # Keep mapping aligned with run_logical_federated_round wave scheduling:
+            # wave index i maps to physical_ids[i % len(physical_ids)].
+            mapped_nodes = []
+            candidates = physical_ids if physical_ids else self.devices
+            for i, node in enumerate(selected_nodes):
+                node_str = str(node)
+                if node_str in self.label_map or node_str in self.fixed_indices:
+                    mapped = node_str
+                elif candidates:
+                    mapped = candidates[i % len(candidates)]
+                else:
+                    mapped = node_str
+                mapped_nodes.append(mapped)
+
+            per_client = self.evaluate_per_client_accuracy(model, mapped_nodes, use_unseen_test=True)
             values = [v for v in per_client.values() if v is not None]
             print("average per-client accuracy: ", values)
             return (sum(values) / len(values)) if values else 0.0
         else:
-            return 0
+            eval_dataset = datasets.CIFAR10(
+                root='data/',
+                train=False,
+                download=False,
+                transform=self.transform,
+            )
+            test_loader = DataLoader(eval_dataset, batch_size=32, shuffle=False)
 
+            with torch.no_grad():
+                for images, labels in test_loader:
+                    outputs = model(images)
+                    _, predicted = torch.max(outputs, 1)
+                    correct += (predicted == labels).sum().item()
+                    total += labels.size(0)
+            accuracy = 100 * correct / total
+            return accuracy
 
 
     def evaluate_per_client_accuracy(self, model, nodes, use_unseen_test=True):
@@ -601,7 +628,7 @@ class TopologyProvider:
         scores.sort(key=lambda x: x[1], reverse=True)
 
         # 4. Greedily select nodes with label coverage
-        selected = set()
+        selected = []
         covered_labels = set()
 
         for node, _ in scores:
@@ -894,11 +921,12 @@ class TopologyProvider:
         normalized_utilities = []
         for node in self.utility_log:
             if self.total_rounds_elapsed > 0:
-               pi_k = self.availability_counts[node] / self.total_rounds_elapsed
+               pi_k = self.awpsp_availability_counts[node] / self.total_rounds_elapsed
                u_k = self.utility_log[node]
-               print(f"for node {node}, pi_k = {pi_k} and u_k = {u_k}") 
-               u_tilde_k = u_k / pi_k
-               normalized_utilities.append(u_tilde_k)
+               print(f"for node {node}, pi_k = {pi_k} and u_k = {u_k}")
+               if pi_k > 0:
+                  u_tilde_k = u_k / pi_k
+                  normalized_utilities.append(u_tilde_k)
 
         if normalized_utilities:
             mean_u = sum(normalized_utilities) / len(normalized_utilities)
@@ -941,11 +969,13 @@ class TopologyProvider:
         print("nodes and scores", scores)
     
         # 4. Greedily pick nodes that maximize class coverage from top-ranked
-        selected = set()
+        selected = []
         covered_labels = set()
         sel_scores = []
         for node, score in scores:
-            selected.add(node)
+            if node in selected:
+                continue
+            selected.append(node)
             sel_scores.append(score)   # <-- record score for avg
             covered_labels.update(label_map.get(node, []))
             if len(selected) >= num_clients:
@@ -965,11 +995,21 @@ class TopologyProvider:
         full_test_dataset = datasets.CIFAR10(
             root='data/', train=False, download=False, transform=self.transform)
 
+        test_targets = np.array(full_test_dataset.targets)
         node_test_loaders = {}
 
         for node in selected:
             self.awpsp_availability_counts[node] += 1
-            indices = [i for i in self.fixed_indices[node] if full_test_dataset[i][1] in covered_labels]
+            # fixed_indices are built from train split (size 50k). When evaluating on
+            # test split (size 10k), guard against out-of-bounds indices.
+            candidate_indices = self.fixed_indices.get(node, [])
+            valid_indices = [i for i in candidate_indices if 0 <= i < len(full_test_dataset)]
+
+            if valid_indices:
+                indices = [i for i in valid_indices if int(test_targets[i]) in covered_labels]
+            else:
+                # Fallback when no valid per-node fixed indices exist on test split.
+                indices = np.where(np.isin(test_targets, list(covered_labels)))[0].tolist()
 
             subset = torch.utils.data.Subset(full_test_dataset, indices)
             node_test_loaders[node] = torch.utils.data.DataLoader(subset, batch_size=32, shuffle=False)
@@ -1158,11 +1198,12 @@ class TopologyProvider:
         normalized_utilities = []
         for node in self.utility_log:
             if self.total_rounds_elapsed > 0:
-               pi_k = self.availability_counts[node] / self.total_rounds_elapsed
+               pi_k = self.awpsp_availability_counts[node] / self.total_rounds_elapsed
                u_k = self.utility_log[node]
-               print(f"for node {node}, pi_k = {pi_k} and u_k = {u_k}") 
-               u_tilde_k = u_k / pi_k
-               normalized_utilities.append(u_tilde_k)
+               print(f"for node {node}, pi_k = {pi_k} and u_k = {u_k}")
+               if pi_k > 0:
+                  u_tilde_k = u_k / pi_k
+                  normalized_utilities.append(u_tilde_k)
 
         if normalized_utilities:
             mean_u = sum(normalized_utilities) / len(normalized_utilities)

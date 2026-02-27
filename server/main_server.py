@@ -280,9 +280,9 @@ def run_federated_training():
 #    base_model = init_resnet(train_last_n_blocks=2)  # train layer3 + layer4 + fc
 
     # Two independent weight states
-    current_weights_awpsp = base_model.state_dict()
-    current_weights_psp = copy.deepcopy(current_weights_awpsp)
-
+    current_weights_fair = base_model.state_dict()
+    current_weights_awpsp = copy.deepcopy(current_weights_fair)
+    current_weights_psp = copy.deepcopy(current_weights_fair)
 
     logical_label_map = {}
     for i in range(logical_client_count):
@@ -321,6 +321,7 @@ def run_federated_training():
             "unseen": unseen,
             "variance": variance,
         }
+
 
 
     def compute_participation_stats(participation_log, all_ids):
@@ -428,16 +429,46 @@ def run_federated_training():
         logical_client_ids = [f"h{i}" for i in range(logical_client_count)]
         physical_ids = list(device_registry.keys())[:physical_container_limit]
         if use_logical_scheduling:
-            # AW-PSP over logical clients: score all N logical IDs, select top m.
-            logical_awpsp_scores = {
-                cid: (shared_state.topology.availability_predictor.predict(cid) + ((hash(cid) % 1000) / 1_000_000.0))
-                for cid in logical_client_ids
-            }
-            logical_selected_awpsp = sorted(
-                logical_client_ids,
-                key=lambda cid: logical_awpsp_scores[cid],
-                reverse=True,
-            )[:logical_selected_per_round]
+            # Reuse AW-PSP physical prioritization, driven by AW-PSP model state.
+            awpsp_priority_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+            awpsp_priority_model.fc = torch.nn.Linear(awpsp_priority_model.fc.in_features, 10)
+            awpsp_priority_model.load_state_dict(current_weights_awpsp)
+
+            priority_nodes, *_ = shared_state.topology.prioritize_available_nodes(
+                awpsp_priority_model,
+                current_round,
+                correlated_failures,
+                num_clients=len(physical_ids),
+                label_map=label_map,
+            )
+            prioritized = [n for n in priority_nodes if n in physical_ids]
+            physical_ids = prioritized + [n for n in physical_ids if n not in prioritized]
+
+            # Build logical selection from prioritized physical order (no separate logical scoring).
+            logical_selected_awpsp = []
+            if physical_ids:
+                bucket_count = len(physical_ids)
+                logical_buckets = [[] for _ in range(bucket_count)]
+                for idx, cid in enumerate(logical_client_ids):
+                    logical_buckets[idx % bucket_count].append(cid)
+
+                slot_order = list(range(bucket_count))
+                bucket_ptrs = [0] * bucket_count
+
+                while len(logical_selected_awpsp) < logical_selected_per_round:
+                    progressed = False
+                    for slot in slot_order:
+                        ptr = bucket_ptrs[slot]
+                        if ptr < len(logical_buckets[slot]):
+                            logical_selected_awpsp.append(logical_buckets[slot][ptr])
+                            bucket_ptrs[slot] += 1
+                            progressed = True
+                            if len(logical_selected_awpsp) >= logical_selected_per_round:
+                                break
+                    if not progressed:
+                        break
+            else:
+                logical_selected_awpsp = logical_client_ids[:logical_selected_per_round]
 
             # PSP logical baseline
             logical_selected_psp = random.sample(
@@ -473,14 +504,14 @@ def run_federated_training():
         selection_end = time.perf_counter()
         if use_logical_scheduling:
             weights_fair = shared_state.topology.run_logical_federated_round(
-                selected, physical_ids, current_weights_awpsp
+                selected, physical_ids, current_weights_fair
             )
         else:
-            weights_fair = shared_state.topology.run_federated_round(selected, current_weights_awpsp, base_model)
+            weights_fair = shared_state.topology.run_federated_round(selected, current_weights_fair, base_model)
         if weights_fair is not None:
            base_model.load_state_dict(weights_fair)
            current_weights_awpsp = weights_fair
-           accuracy = shared_state.topology.evaluate_global_model(base_model, use_selected_nodes=True)
+           accuracy = shared_state.topology.evaluate_global_model(base_model, selected_nodes=selected, use_selected_nodes=True, physical_ids=physical_ids if use_logical_scheduling else None)
            accuracy_log.append((current_round, accuracy))
            var_u_log.append((current_round, var_u))
            surrogate_log.append((current_round, total_bias_bound))
@@ -505,7 +536,7 @@ def run_federated_training():
             awpsp_instant_var = logical_metrics_awpsp["variance"]
             awpsp_cumul_var, awpsp_gini = compute_participation_stats(logical_participation_awpsp, logical_client_ids)
             awpsp_covered_labels = logical_metrics_awpsp["covered_labels"]
-            awpsp_avg_score = sum(logical_awpsp_scores[cid] for cid in selected_awpsp) / len(selected_awpsp) if selected_awpsp else 0.0
+            awpsp_avg_score = float(len(selected_awpsp)) / float(max(1, logical_client_count))
             awpsp_labels = logical_metrics_awpsp["covered_labels"]
             awpsp_KL = logical_metrics_awpsp["kl"]
             awpsp_unseen = logical_metrics_awpsp["unseen"]
@@ -527,7 +558,7 @@ def run_federated_training():
         if weights_awpsp is not None:
            current_weights_awpsp = weights_awpsp
            awpsp_model.load_state_dict(current_weights_awpsp)
-           accuracy_awpsp = shared_state.topology.evaluate_global_model(awpsp_model, selected_nodes=selected_awpsp, use_selected_nodes=True)
+           accuracy_awpsp = shared_state.topology.evaluate_global_model(awpsp_model, selected_nodes=selected_awpsp, use_selected_nodes=False, physical_ids=physical_ids if use_logical_scheduling else None)           
            awpsp_accuracy_log.append((current_round, accuracy_awpsp))
            awpsp_instant_fairness_log.append((current_round, awpsp_instant_var))
            awpsp_cumul_fairness_log.append((current_round, awpsp_cumul_var))
@@ -577,7 +608,7 @@ def run_federated_training():
         if weights_psp is not None:
            current_weights_psp = weights_psp
            psp_model.load_state_dict(current_weights_psp)
-           accuracy_psp = shared_state.topology.evaluate_global_model(psp_model, selected_nodes=selected_psp, use_selected_nodes=True)
+           accuracy_psp = shared_state.topology.evaluate_global_model(psp_model, selected_nodes=selected_psp, use_selected_nodes=False, physical_ids=physical_ids  if use_logical_scheduling else None)           
            psp_accuracy_log.append((current_round, accuracy_psp))
            psp_instant_fairness_log.append((current_round, psp_instant_var))
            psp_cumul_fairness_log.append((current_round, psp_cumul_var))
