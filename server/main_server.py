@@ -9,6 +9,8 @@ import time
 import copy
 import math
 import random
+import json
+import numpy as np
 from typing import Dict, Tuple
 from collections import defaultdict
 from torchvision import models
@@ -79,6 +81,7 @@ current_round = 0
 
 # Global device registry
 device_registry = {}
+REGISTERED_CLIENTS_CACHE = os.getenv("REGISTERED_CLIENTS_CACHE", "registered_clients.json")
 #topology = None  # ← define globally so update_status() can access it
 #current_round = 0  # make current_round global to
 
@@ -97,6 +100,15 @@ def register():
         "port": data["port"]
     }
 
+    # Persist registrations so experiment sweeps can reuse the same physical clients
+    # across subprocess runs without waiting for fresh re-registration.
+    try:
+        with open(REGISTERED_CLIENTS_CACHE, "w") as f:
+            json.dump(device_registry, f)
+    except Exception as e:
+        print(f"⚠️ Could not persist registered clients cache: {e}")
+
+
     print(f"📥 Registered {data['device_id']} at {data['ip']}:{data['port']}")
 
     return "OK", 200
@@ -113,8 +125,24 @@ def ready():
         return "ready", 200
     return "not_ready", 503
 
-def initialize_topology(device_file="devices.txt", num_clients=2):
-    print("⏳ Waiting for clients to register...")
+
+def initialize_topology(device_file="devices.txt", num_clients=None):
+    if num_clients is None:
+        num_clients = int(os.getenv("REGISTERED_CLIENT_COUNT", os.getenv("PHYSICAL_CONTAINER_LIMIT", "2")))
+
+    reuse_registered_clients = os.getenv("REUSE_REGISTERED_CLIENTS", "1").lower() in ("1", "true", "yes", "on")
+    if reuse_registered_clients and len(device_registry) < num_clients and os.path.exists(REGISTERED_CLIENTS_CACHE):
+        try:
+            with open(REGISTERED_CLIENTS_CACHE, "r") as f:
+                cached = json.load(f)
+            if isinstance(cached, dict):
+                for k, v in cached.items():
+                    if isinstance(v, dict) and "ip" in v and "port" in v:
+                        device_registry[k] = v
+                print(f"♻️ Loaded {len(device_registry)} cached registered clients from {REGISTERED_CLIENTS_CACHE}")
+        except Exception as e:
+            print(f"⚠️ Could not load registered clients cache: {e}")
+
     while len(device_registry) < num_clients:
         print(f"🕒 Registered devices: {len(device_registry)} / {num_clients}")
         time.sleep(2)
@@ -159,8 +187,7 @@ def initialize_topology(device_file="devices.txt", num_clients=2):
           "correlation": None
         }
     print("✅ Topology initialized.")
-    wait_for_latency_data()
-
+    wait_for_latency_data(num_clients=num_clients)
 
 
 @app.route("/status_update", methods=["POST"])
@@ -200,7 +227,7 @@ def health():
 # -------------------------------
 
 import torch.nn as nn
-from torchvision import models
+from torchvision import models, datasets
 
 def init_resnet(train_last_n_blocks=1):
     base_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
@@ -229,19 +256,106 @@ def init_resnet(train_last_n_blocks=1):
 
 
 
+
+
+
+
+def _env_int(name, default):
+    return int(os.getenv(name, str(default)))
+
+
+def _env_float(name, default):
+    return float(os.getenv(name, str(default)))
+
+
+def _env_bool(name, default):
+    return os.getenv(name, str(default)).lower() in ("1", "true", "yes", "on")
+
+
+def build_logical_label_map(logical_client_count, labels_per_client, split_mode="extreme", dirichlet_alpha=0.5, seed=0):
+    rng = np.random.default_rng(seed)
+    split_mode = (split_mode or "extreme").lower()
+    label_map = {}
+
+    if split_mode == "dirichlet":
+        for i in range(logical_client_count):
+            probs = rng.dirichlet(np.full(10, max(dirichlet_alpha, 1e-3)))
+            labels = list(np.argsort(probs)[-labels_per_client:])
+            label_map[f"h{i}"] = sorted(int(x) for x in labels)
+        return label_map
+
+    overlap_shift = 1 if split_mode == "overlap" else labels_per_client
+    for i in range(logical_client_count):
+        start = (i * overlap_shift) % 10
+        labels = [((start + j) % 10) for j in range(labels_per_client)]
+        label_map[f"h{i}"] = labels
+    return label_map
+
+
+def apply_correlation_noise(correlated_failures, node_pool, noise_pct=0.0, seed=0):
+    if noise_pct <= 0 or not node_pool:
+        return correlated_failures
+    rng = random.Random(seed)
+    noisy = list(correlated_failures)
+    k = max(1, int(len(noisy) * noise_pct / 100.0)) if noisy else 0
+    for _ in range(k):
+        if noisy and rng.random() < 0.5:
+            noisy.pop(rng.randrange(len(noisy)))
+        a = rng.choice(node_pool)
+        b = rng.choice(node_pool)
+        if a != b:
+            noisy.append((a, b))
+    return noisy
+
+
+
+
+
 def run_federated_training():
     global current_round
     if shared_state.topology is None:
         raise RuntimeError("❌ Topology has not been initialized.")
 
-    logical_client_count = 100
-    physical_container_limit = 4
-    logical_selected_per_round = 10
-    use_logical_scheduling = True
-    logical_labels_per_client = 2
+
+    seed = _env_int("EXPERIMENT_SEED", 42)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    logical_client_count = _env_int("LOGICAL_CLIENT_COUNT", 100)
+    physical_container_limit = _env_int("PHYSICAL_CONTAINER_LIMIT", 10)
+    logical_selected_per_round = _env_int("LOGICAL_SELECTED_PER_ROUND", 10)
+    use_logical_scheduling = _env_bool("USE_LOGICAL_SCHEDULING", True)
+    logical_labels_per_client = _env_int("LOGICAL_LABELS_PER_CLIENT", 2)
+    split_mode = os.getenv("LOGICAL_SPLIT_MODE", "extreme")
+    dirichlet_alpha = _env_float("DIRICHLET_ALPHA", 0.5)
+    selector_mode = os.getenv("SELECTOR_MODE", "awpsp").lower()
+    corr_noise_pct = _env_float("CORRELATION_NOISE_PCT", 0.0)
+
+    experiment_context = {
+        "logical_population": logical_client_count,
+        "selected_per_round": logical_selected_per_round,
+        "physical_clients": physical_container_limit,
+        "split_mode": split_mode,
+        "dirichlet_alpha": dirichlet_alpha,
+        "selector_mode": selector_mode,
+        "correlation_noise_pct": corr_noise_pct,
+        "seed": seed,
+    }
+    
+    metrics_log_path = os.getenv("METRICS_LOG_PATH", "metrics_log.csv")
+    final_metrics_path = os.getenv("FINAL_METRICS_PATH", "final_metrics.csv")
     logical_participation_awpsp = defaultdict(int)
     logical_participation_psp = defaultdict(int)
+    logical_participation_oort = defaultdict(int)
     logical_participation_log = defaultdict(int)
+    # Oort-style selector state (utility/reward + exploration + duration penalty).
+    oort_pull_count = defaultdict(int)
+    oort_reward_ema = defaultdict(float)
+    oort_duration_ema = defaultdict(lambda: 1.0)
+    logical_loss_history_awpsp = defaultdict(list)
+    logical_loss_history_psp = defaultdict(list)
+    logical_loss_history_oort = defaultdict(list)
 
     label_map = shared_state.topology.label_map
 
@@ -250,28 +364,39 @@ def run_federated_training():
 
     awpsp_accuracy_log = []
     psp_accuracy_log = [] 
+    oort_accuracy_log = []
     awpsp_instant_fairness_log = []
     psp_instant_fairness_log = []
+    oort_instant_fairness_log = []
     awpsp_cumul_fairness_log = []
     psp_cumul_fairness_log = []  
+    oort_cumul_fairness_log = []
     corr_failure_log = []
     awpsp_covered_labels_log = []
     psp_covered_labels_log = []
+    oort_covered_labels_log = []
     selected_awpsp_log = []
     selected_psp_log = []
+    selected_oort_log = []
     awpsp_avg_score_log = []
     psp_avg_score_log = []
+    oort_avg_score_log = []
     awpsp_labels_log =[]
     psp_labels_log =[]
+    oort_labels_log =[]
     awpsp_KL_log =[]
     psp_KL_log =[]
+    oort_KL_log =[]
     awpsp_unseen_log =[]
     psp_unseen_log =[]
+    oort_unseen_log =[]
     awpsp_gini_log =[]
     psp_gini_log =[]
+    oort_gini_log =[]
     accuracy_log = []
     var_u_log = []
     surrogate_log = []
+
 
     # ---------------- Initialize models ----------------
 #    base_model = models.resnet18(weights=None)
@@ -283,12 +408,16 @@ def run_federated_training():
     current_weights_fair = base_model.state_dict()
     current_weights_awpsp = copy.deepcopy(current_weights_fair)
     current_weights_psp = copy.deepcopy(current_weights_fair)
+    current_weights_oort = copy.deepcopy(current_weights_fair)
 
-    logical_label_map = {}
-    for i in range(logical_client_count):
-        start = (i * logical_labels_per_client) % 10
-        labels = [(start + j) % 10 for j in range(logical_labels_per_client)]
-        logical_label_map[f"h{i}"] = labels
+
+    logical_label_map = build_logical_label_map(
+        logical_client_count,
+        logical_labels_per_client,
+        split_mode=split_mode,
+        dirichlet_alpha=dirichlet_alpha,
+        seed=seed,
+    )
 
     def compute_logical_label_metrics(selected_ids):
         total_labels = 10
@@ -339,6 +468,52 @@ def run_federated_training():
                 diffs += abs(i - j)
         gini = diffs / (2 * len(counts) * total_counts)
         return variance, gini
+
+
+
+    def compute_logical_model_loss_fairness(model, selected_ids, history_map, all_ids):
+        eval_dataset = datasets.CIFAR10(
+            root='data/',
+            train=False,
+            download=False,
+            transform=shared_state.topology.transform,
+        )
+        targets = np.array(eval_dataset.targets)
+        criterion = torch.nn.CrossEntropyLoss(reduction="none")
+
+        model.eval()
+        current_losses = {}
+        with torch.no_grad():
+            for logical_id in selected_ids:
+                labels = logical_label_map.get(logical_id, [])
+                if not labels:
+                    continue
+                indices = np.where(np.isin(targets, labels))[0].tolist()
+                if not indices:
+                    continue
+                subset = torch.utils.data.Subset(eval_dataset, indices)
+                loader = torch.utils.data.DataLoader(subset, batch_size=64, shuffle=False)
+                losses = []
+                for images, y in loader:
+                    outputs = model(images)
+                    batch_losses = criterion(outputs, y.long())
+                    losses.extend(batch_losses.tolist())
+                if losses:
+                    avg_loss = float(sum(losses) / len(losses))
+                    current_losses[logical_id] = avg_loss
+                    history_map[logical_id].append(avg_loss)
+
+        instant_var = float(np.var(list(current_losses.values()))) if current_losses else 0.0
+
+        cumulative_values = []
+        for cid in all_ids:
+            if history_map[cid]:
+                cumulative_values.append(float(sum(history_map[cid]) / len(history_map[cid])))
+        cumulative_var = float(np.var(cumulative_values)) if cumulative_values else 0.0
+
+        return instant_var, cumulative_var
+
+
 
     def compute_final_metrics(model=None, round_index=None):
         if model is None:
@@ -397,6 +572,14 @@ def run_federated_training():
 
         return {
             "Round": round_index + 1,
+            "logical_population": experiment_context["logical_population"],
+            "selected_per_round": experiment_context["selected_per_round"],
+            "physical_clients": experiment_context["physical_clients"],
+            "split_mode": experiment_context["split_mode"],
+            "dirichlet_alpha": experiment_context["dirichlet_alpha"],
+            "selector_mode": experiment_context["selector_mode"],
+            "correlation_noise_pct": experiment_context["correlation_noise_pct"],
+            "seed": experiment_context["seed"],
             "Avg Acc (No Surrogate)": avg_acc,
             "Jain (Acc) (No Surrogate)": jain_acc,
             "Utility CV (No Surrogate)": utility_cv_no,
@@ -413,8 +596,8 @@ def run_federated_training():
         }
 
 
+    num_rounds = _env_int("NUM_ROUNDS", 50)
 
-    num_rounds = 50
     for current_round in range(num_rounds):
         print(f"\n🌐 Federated Round {current_round + 1}")
         round_start = time.perf_counter()
@@ -424,6 +607,14 @@ def run_federated_training():
         # Detect correlated failures
         correlated_failures = shared_state.topology.get_correlated_failure(
             current_round, availability_vectors, corr_threshold=0.35, num_neighbors=4
+        )
+
+
+        correlated_failures = apply_correlation_noise(
+            correlated_failures,
+            list(shared_state.topology.dht.table.keys()),
+            noise_pct=corr_noise_pct,
+            seed=seed + current_round,
         )
 
         logical_client_ids = [f"h{i}" for i in range(logical_client_count)]
@@ -469,6 +660,28 @@ def run_federated_training():
                         break
             else:
                 logical_selected_awpsp = logical_client_ids[:logical_selected_per_round]
+
+
+            # OORT logical baseline
+            latencies = [
+                shared_state.topology.dht.table.get(pid, {}).get("latency", 0.0) or 0.0
+                for pid in physical_ids
+            ]
+            preferred_duration = float(np.percentile(latencies, 50)) if latencies else 1.0
+            preferred_duration = max(preferred_duration, 1.0)
+            oort_scores = {}
+            for cid in logical_client_ids:
+                reward = oort_reward_ema[cid] if oort_pull_count[cid] > 0 else shared_state.topology.availability_predictor.predict(cid)
+                bonus = math.sqrt((2.0 * math.log(current_round + 2.0)) / (oort_pull_count[cid] + 1.0))
+                duration = max(oort_duration_ema[cid], 1e-6)
+                duration_penalty = min(1.0, preferred_duration / duration)
+                oort_scores[cid] = (reward + 0.1 * bonus) * duration_penalty
+            logical_selected_oort = sorted(
+                logical_client_ids,
+                key=lambda cid: oort_scores[cid],
+                reverse=True,
+            )[:logical_selected_per_round]
+
 
             # PSP logical baseline
             logical_selected_psp = random.sample(
@@ -533,6 +746,20 @@ def run_federated_training():
             selected_awpsp = logical_selected_awpsp
             for logical_id in selected_awpsp:
                 logical_participation_awpsp[logical_id] += 1
+                if selector_mode == "oort":
+                    # Online update for Oort-style reward/duration stats.
+                    logical_idx = int(str(logical_id).replace("h", "")) if str(logical_id).startswith("h") else 0
+                    if physical_ids:
+                        mapped_pid = physical_ids[logical_idx % len(physical_ids)]
+                        mapped_latency = shared_state.topology.dht.table.get(mapped_pid, {}).get("latency", 1.0) or 1.0
+                    else:
+                        mapped_latency = 1.0
+                    observed_reward = shared_state.topology.availability_predictor.predict(logical_id)
+                    beta = 0.8
+                    oort_reward_ema[logical_id] = beta * oort_reward_ema[logical_id] + (1.0 - beta) * observed_reward
+                    oort_duration_ema[logical_id] = beta * oort_duration_ema[logical_id] + (1.0 - beta) * float(mapped_latency)
+                    oort_pull_count[logical_id] += 1
+
             awpsp_instant_var = logical_metrics_awpsp["variance"]
             awpsp_cumul_var, awpsp_gini = compute_participation_stats(logical_participation_awpsp, logical_client_ids)
             awpsp_covered_labels = logical_metrics_awpsp["covered_labels"]
@@ -572,6 +799,71 @@ def run_federated_training():
            print("⚠️ No updates received from clients. Skipping model update this round.")
         awpsp_end = time.perf_counter()
 
+
+
+
+        # ---------------- OORT branch ----------------
+        oort_model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        oort_model.fc = torch.nn.Linear(oort_model.fc.in_features, 10)
+        oort_model.load_state_dict(current_weights_oort)
+
+        if use_logical_scheduling:
+            selected_oort = logical_selected_oort
+            for logical_id in selected_oort:
+                logical_idx = int(str(logical_id).replace("h", "")) if str(logical_id).startswith("h") else 0
+                if physical_ids:
+                    mapped_pid = physical_ids[logical_idx % len(physical_ids)]
+                    mapped_latency = shared_state.topology.dht.table.get(mapped_pid, {}).get("latency", 1.0) or 1.0
+                else:
+                    mapped_latency = 1.0
+                observed_reward = shared_state.topology.availability_predictor.predict(logical_id)
+                beta = 0.8
+                oort_reward_ema[logical_id] = beta * oort_reward_ema[logical_id] + (1.0 - beta) * observed_reward
+                oort_duration_ema[logical_id] = beta * oort_duration_ema[logical_id] + (1.0 - beta) * float(mapped_latency)
+                oort_pull_count[logical_id] += 1
+            for logical_id in selected_oort:
+                logical_participation_oort[logical_id] += 1
+            oort_instant_var, oort_cumul_var = compute_logical_model_loss_fairness(
+                oort_model, selected_oort, logical_loss_history_oort, logical_client_ids
+            )
+            _, oort_gini = compute_participation_stats(logical_participation_oort, logical_client_ids)
+            oort_metrics = compute_logical_label_metrics(selected_oort)
+            oort_covered_labels = oort_metrics["covered_labels"]
+            oort_avg_score = float(len(selected_oort)) / float(max(1, logical_client_count))
+            oort_labels = oort_covered_labels
+            oort_KL = oort_metrics["kl"]
+            oort_unseen = oort_metrics["unseen"]
+        else:
+            selected_oort, oort_instant_var, oort_cumul_var, oort_covered_labels, oort_avg_score, oort_labels, oort_KL, oort_unseen, oort_gini =                 shared_state.topology.prioritize_available_nodes(
+                    oort_model, current_round, correlated_failures, num_clients=5, label_map=label_map
+                )
+        oort_covered_labels_log.append((current_round, len(oort_covered_labels)))
+        selected_oort_log.append((current_round, selected_oort))
+
+        if use_logical_scheduling:
+            weights_oort = shared_state.topology.run_logical_federated_round(
+                selected_oort, physical_ids, current_weights_oort
+            )
+        else:
+            weights_oort = shared_state.topology.run_federated_round(selected_oort, current_weights_oort, oort_model)
+
+        if weights_oort is not None:
+           current_weights_oort = weights_oort
+           oort_model.load_state_dict(current_weights_oort)
+           accuracy_oort = shared_state.topology.evaluate_global_model(oort_model, selected_nodes=selected_oort, use_selected_nodes=True, physical_ids=physical_ids if use_logical_scheduling else None)
+           oort_accuracy_log.append((current_round, accuracy_oort))
+           oort_instant_fairness_log.append((current_round, oort_instant_var))
+           oort_cumul_fairness_log.append((current_round, oort_cumul_var))
+           print(f"🔁 Round {current_round + 1}: OORT Acc = {accuracy_oort:.2f}%")
+           oort_avg_score_log.append((current_round, oort_avg_score))
+           oort_labels_log.append((current_round, oort_labels))
+           oort_KL_log.append((current_round, oort_KL))
+           oort_unseen_log.append((current_round, oort_unseen))
+           oort_gini_log.append((current_round, oort_gini))
+        else:
+           print("⚠️ No updates received from clients. Skipping model update this round.")
+
+
         # ---------------- PSP branch ----------------
         # Use a fresh model copy so AW-PSP doesn’t pollute PSP results
         #psp_model = models.resnet18(weights=None)
@@ -583,8 +875,13 @@ def run_federated_training():
             selected_psp = logical_selected_psp
             for logical_id in selected_psp:
                 logical_participation_psp[logical_id] += 1
-            psp_instant_var = logical_metrics_psp["variance"]
-            psp_cumul_var, psp_gini = compute_participation_stats(logical_participation_psp, logical_client_ids)
+            psp_instant_var, psp_cumul_var = compute_logical_model_loss_fairness(
+                psp_model,
+                selected_psp,
+                logical_loss_history_psp,
+                logical_client_ids,
+            )
+            _, psp_gini = compute_participation_stats(logical_participation_psp, logical_client_ids)
             psp_covered_labels = logical_metrics_psp["covered_labels"]
             psp_avg_score = float(len(selected_psp)) / float(max(1, logical_client_count))
             psp_labels = logical_metrics_psp["covered_labels"]
@@ -624,9 +921,44 @@ def run_federated_training():
         psp_end = time.perf_counter()
 
         # Save per-round logs to CSV (append one row per round)
-        metrics_header = ["Round", "Select_Fair_Accuracy", "Select_Fair_variance", "Select_Fair_Surrogate", "AWPSP_Accuracy", "AWPSP_instant_fairness", "AWPSP_cumul_fairness","CorrelatedFailureCount", "AWPSP_CoveredLabelsCount", "PSP_Accuracy", "PSP_instant_fairness", "PSP_cumul_fairness", "PSP_CoveredLAbelsCount", "selected_awpsp", "selected_psp", "AWPSP Avg Score", "PSP Avg Score", "AWPSP labels", "PSP labels", "AWPSP KL", "PSP KL", "AWPSP unseen", "PSP unseen", "AWPSP gini", "PSP gini"]
+        metrics_header = [
+            "Round",
+            "logical_population",
+            "selected_per_round",
+            "physical_clients",
+            "split_mode",
+            "dirichlet_alpha",
+            "selector_mode",
+            "correlation_noise_pct",
+            "seed",
+            "Select_Fair_Accuracy",
+            "Select_Fair_variance",
+            "Select_Fair_Surrogate",
+            "AWPSP_Accuracy",
+            "AWPSP_instant_fairness",
+            "AWPSP_cumul_fairness",
+            "CorrelatedFailureCount",
+            "AWPSP_CoveredLabelsCount",
+            "PSP_Accuracy",
+            "PSP_instant_fairness",
+            "PSP_cumul_fairness",
+            "PSP_CoveredLAbelsCount",
+            "selected_awpsp",
+            "selected_psp",
+            "AWPSP Avg Score",
+            "PSP Avg Score",
+            "AWPSP labels",
+            "PSP labels",
+            "AWPSP KL",
+            "PSP KL",
+            "AWPSP unseen",
+            "PSP unseen",
+            "AWPSP gini",
+            "PSP gini",
+        ]
         metrics_mode = "w" if current_round == 0 else "a"
-        with open("metrics_log.csv", metrics_mode, newline="") as f:
+
+        with open(metrics_log_path, metrics_mode, newline="") as f:
             writer = csv.writer(f)
             if current_round == 0:
                 writer.writerow(metrics_header)
@@ -636,6 +968,14 @@ def run_federated_training():
 
             writer.writerow([
                 current_round,
+                experiment_context["logical_population"],
+                experiment_context["selected_per_round"],
+                experiment_context["physical_clients"],
+                experiment_context["split_mode"],
+                experiment_context["dirichlet_alpha"],
+                experiment_context["selector_mode"],
+                experiment_context["correlation_noise_pct"],
+                experiment_context["seed"],
                 accuracy_log[-1][1] if accuracy_log else None,
                 var_u_log[-1][1] if var_u_log else None,
                 surrogate_log[-1][1] if surrogate_log else None,
@@ -667,8 +1007,8 @@ def run_federated_training():
             print("Final metrics summary:")
             for key, value in summary.items():
                 print(f"{key}: {value}")
-            write_header = not os.path.exists("final_metrics.csv")
-            with open("final_metrics.csv", "a") as f:
+            write_header = not os.path.exists(final_metrics_path)
+            with open(final_metrics_path, "a") as f:
                 writer = csv.writer(f)
                 if write_header:
                     writer.writerow(list(summary.keys()))

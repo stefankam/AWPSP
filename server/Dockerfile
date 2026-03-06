@@ -20,8 +20,7 @@ RUN apt-get update && apt-get install -y \
 # --------------------------
 COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m pip install --upgrade pip && \
-    pip3 install --no-cache-dir -r /tmp/requirements.txt
-
+    pip3 install --no-cache-dir -r /tmp/requirements.txt 
 
 # --------------------------
 # 3. Set working directory
@@ -37,6 +36,7 @@ COPY traces/ traces/
 COPY topology_server.py .
 COPY shared_state.py .	
 COPY availability.py .
+COPY experiment_suite.py .
 
 # --------------------------
 # 5. Set environment
