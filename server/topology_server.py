@@ -938,7 +938,7 @@ class TopologyProvider:
 
 
 
-        return selected, var_u, fairness_inter_class, covered_labels, avg_sel_score, np.sum(class_counts>0), kl, unseen_rate, gini
+        return selected, instant_fairness_variance, cumulative_fairness_variance, avg_within_class_var, fairness_inter_class, covered_labels, avg_sel_score, np.sum(class_counts>0), kl, unseen_rate, gini
 
 
     def prioritize_available_nodes(self, model, current_round, correlated_failures, num_clients, label_map):
@@ -1097,7 +1097,7 @@ class TopologyProvider:
 
         # Logging
         print(f"[FAIRNESS] inter-class var = {fairness_inter_class:.6f}  (rel {fairness_inter_class_rel:.6f}), "
-              f"avg-within-class-var = {avg_within_class_var:.6f}, classes-used = {len(valid_class_means)}")
+              f"wavg-within-class-var = {avg_within_class_var:.6f}, classes-used = {len(valid_class_means)}")
 
 
         # ---- Fairness Metric 1: Instant (Current Round) ----
@@ -1213,8 +1213,7 @@ class TopologyProvider:
         else:
             var_u = 0
 
-
-        return selected, var_u, fairness_inter_class, covered_labels, avg_sel_score, np.sum(class_counts>0), kl, unseen_rate, gini
+        return selected, instant_fairness_variance, cumulative_fairness_variance, avg_within_class_var,  fairness_inter_class, covered_labels, avg_sel_score, np.sum(class_counts>0), kl, unseen_rate, gini
 
 
 # Distributed Hash Table

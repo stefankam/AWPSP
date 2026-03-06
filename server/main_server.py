@@ -396,6 +396,10 @@ def run_federated_training():
     accuracy_log = []
     var_u_log = []
     surrogate_log = []
+    awpsp_avg_within_class_log = []
+    psp_avg_within_class_log = []
+    awpsp_fairness_inter_class_log = []
+    psp_fairness_inter_class_log = []
 
 
     # ---------------- Initialize models ----------------
@@ -483,6 +487,7 @@ def run_federated_training():
 
         model.eval()
         current_losses = {}
+        class_losses = defaultdict(list)
         with torch.no_grad():
             for logical_id in selected_ids:
                 labels = logical_label_map.get(logical_id, [])
@@ -498,20 +503,21 @@ def run_federated_training():
                     outputs = model(images)
                     batch_losses = criterion(outputs, y.long())
                     losses.extend(batch_losses.tolist())
+                    for lbl, loss in zip(y.tolist(), batch_losses.tolist()):
+                        class_losses[int(lbl)].append(float(loss))
                 if losses:
                     avg_loss = float(sum(losses) / len(losses))
                     current_losses[logical_id] = avg_loss
                     history_map[logical_id].append(avg_loss)
 
-        instant_var = float(np.var(list(current_losses.values()))) if current_losses else 0.0
+        per_class_vars = [float(np.var(v)) for v in class_losses.values() if v]
+        avg_within_class_var = float(sum(per_class_vars) / len(per_class_vars)) if per_class_vars else 0.0
 
-        cumulative_values = []
-        for cid in all_ids:
-            if history_map[cid]:
-                cumulative_values.append(float(sum(history_map[cid]) / len(history_map[cid])))
-        cumulative_var = float(np.var(cumulative_values)) if cumulative_values else 0.0
+        class_means = [float(np.mean(v)) for v in class_losses.values() if v]
+        fairness_inter_class = float(np.var(class_means, ddof=0)) if class_means else 0.0
 
-        return instant_var, cumulative_var
+        return avg_within_class_var, fairness_inter_class
+
 
 
 
@@ -762,13 +768,22 @@ def run_federated_training():
 
             awpsp_instant_var = logical_metrics_awpsp["variance"]
             awpsp_cumul_var, awpsp_gini = compute_participation_stats(logical_participation_awpsp, logical_client_ids)
+
+            avg_within_class_var, fairness_inter_class = compute_logical_model_loss_fairness(
+                awpsp_model,
+                selected_awpsp,,
+                logical_loss_history_awpsp,
+                logical_client_ids,
+            )
+
             awpsp_covered_labels = logical_metrics_awpsp["covered_labels"]
             awpsp_avg_score = float(len(selected_awpsp)) / float(max(1, logical_client_count))
             awpsp_labels = logical_metrics_awpsp["covered_labels"]
             awpsp_KL = logical_metrics_awpsp["kl"]
             awpsp_unseen = logical_metrics_awpsp["unseen"]
         else:
-            selected_awpsp, awpsp_instant_var, awpsp_cumul_var, awpsp_covered_labels, awpsp_avg_score, awpsp_labels, awpsp_KL, awpsp_unseen, awpsp_gini = \
+
+            selected_awpsp, awpsp_instant_var, awpsp_cumul_var, avg_within_class_var, fairness_inter_class, awpsp_covered_labels, awpsp_avg_score, awpsp_labels, awpsp_KL, awpsp_unseen, awpsp_gini = \
                 shared_state.topology.prioritize_available_nodes(
                     awpsp_model, current_round, correlated_failures, num_clients=5, label_map=label_map
                 )
@@ -795,6 +810,8 @@ def run_federated_training():
            awpsp_KL_log.append((current_round, awpsp_KL))
            awpsp_unseen_log.append((current_round, awpsp_unseen))
            awpsp_gini_log.append((current_round, awpsp_gini))
+           awpsp_avg_within_class_log.append(avg_within_class_var)
+           awpsp_fairness_inter_class_log.append(fairness_inter_class)
         else:
            print("⚠️ No updates received from clients. Skipping model update this round.")
         awpsp_end = time.perf_counter()
@@ -834,7 +851,7 @@ def run_federated_training():
             oort_KL = oort_metrics["kl"]
             oort_unseen = oort_metrics["unseen"]
         else:
-            selected_oort, oort_instant_var, oort_cumul_var, oort_covered_labels, oort_avg_score, oort_labels, oort_KL, oort_unseen, oort_gini =                 shared_state.topology.prioritize_available_nodes(
+            selected_oort, oort_instant_var, oort_cumul_var, avg_within_class_var, fairness_inter_class, oort_covered_labels, oort_avg_score, oort_labels, oort_KL, oort_unseen, oort_gini =                 shared_state.topology.prioritize_available_nodes(
                     oort_model, current_round, correlated_failures, num_clients=5, label_map=label_map
                 )
         oort_covered_labels_log.append((current_round, len(oort_covered_labels)))
@@ -875,7 +892,11 @@ def run_federated_training():
             selected_psp = logical_selected_psp
             for logical_id in selected_psp:
                 logical_participation_psp[logical_id] += 1
-            psp_instant_var, psp_cumul_var = compute_logical_model_loss_fairness(
+
+            psp_instant_var = logical_metrics_psp["variance"]
+            psp_cumul_var, psp_gini = compute_participation_stats(logical_participation_psp, logical_client_ids)
+
+            avg_within_class_var, fairness_inter_class = compute_logical_model_loss_fairness(
                 psp_model,
                 selected_psp,
                 logical_loss_history_psp,
@@ -888,7 +909,7 @@ def run_federated_training():
             psp_KL = logical_metrics_psp["kl"]
             psp_unseen = logical_metrics_psp["unseen"]
         else:
-            selected_psp, psp_instant_var, psp_cumul_var, psp_covered_labels, psp_avg_score, psp_labels, psp_KL, psp_unseen, psp_gini = \
+            selected_psp, psp_instant_var, psp_cumul_var, avg_within_class_var, fairness_inter_class, psp_covered_labels, psp_avg_score, psp_labels, psp_KL, psp_unseen, psp_gini = \
                 shared_state.topology.psp_random_selection(
                     psp_model, correlated_failures, num_clients=5, label_map=label_map
                 )
@@ -915,6 +936,8 @@ def run_federated_training():
            psp_KL_log.append((current_round, psp_KL))
            psp_unseen_log.append((current_round, psp_unseen))
            psp_gini_log.append((current_round, psp_gini))
+           psp_avg_within_class_log.append(avg_within_class_var)
+           psp_fairness_inter_class_log.append(fairness_inter_class)
         else:
            print("⚠️ No updates received from clients. Skipping model update this round.")
 
@@ -937,11 +960,15 @@ def run_federated_training():
             "AWPSP_Accuracy",
             "AWPSP_instant_fairness",
             "AWPSP_cumul_fairness",
+            "AWPSP_avg_within_class",
+            "AWPSP_fairness_inter_class",
             "CorrelatedFailureCount",
             "AWPSP_CoveredLabelsCount",
             "PSP_Accuracy",
             "PSP_instant_fairness",
             "PSP_cumul_fairness",
+            "PSP_avg_within_class",
+            "PSP_fairness_inter_class",
             "PSP_CoveredLAbelsCount",
             "selected_awpsp",
             "selected_psp",
@@ -982,11 +1009,14 @@ def run_federated_training():
                 awpsp_accuracy_log[-1][1] if awpsp_accuracy_log else None,
                 awpsp_instant_fairness_log[-1][1] if awpsp_instant_fairness_log else None,
                 awpsp_cumul_fairness_log[-1][1] if awpsp_cumul_fairness_log else None,
+                awpsp_avg_within_class_log[-1][1] if psp_cumul_fairness_log else None,
+                awpsp_fairness_inter_class_log[-1][1] if psp_instant_fairness_log else None,
                 corr_failure_log[-1][1] if corr_failure_log else None,
                 awpsp_covered_labels_log[-1][1] if awpsp_covered_labels_log else None,
                 psp_accuracy_log[-1][1] if psp_accuracy_log else None,
                 psp_instant_fairness_log[-1][1] if psp_instant_fairness_log else None,
-                psp_cumul_fairness_log[-1][1] if psp_cumul_fairness_log else None,
+                psp_avg_within_class_log[-1][1] if psp_cumul_fairness_log else None,
+                psp_fairness_inter_class_log[-1][1] if psp_instant_fairness_log else None,
                 psp_covered_labels_log[-1][1] if psp_covered_labels_log else None,
                 selected_awpsp_log[-1][1] if selected_awpsp_log else None,
                 selected_psp_log[-1][1] if selected_psp_log else None,
