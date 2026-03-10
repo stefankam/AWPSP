@@ -112,13 +112,14 @@ def run_suite():
     populations = [100, 300, 1000, 3000]
     selections = [10, 20, 50, 100]
     split_modes = ["overlap", "dirichlet"]
+    labels_per_client_options = [2, 5, 10]
     selectors = ["awpsp"]
     noises = [0, 10, 20, 40]
     seeds = [0]
 
     rows = []
     result_fields = [
-        "N", "m", "split_mode", "selector", "noise_pct", "seed",
+        "N", "m", "split_mode", "labels_per_client", "selector",  "noise_pct", "seed",
         "return_code", "awpsp_accuracy_last", "stdout_tail", "stderr_tail",
         "metrics_path", "final_metrics_path"
     ]
@@ -126,60 +127,64 @@ def run_suite():
         writer = csv.DictWriter(f, fieldnames=result_fields)
         writer.writeheader()
 
-    total = len(populations) * len(selections) * len(split_modes) * len(selectors) * len(noises) * len(seeds)
+    total = len(populations) * len(selections) * len(split_modes) * len(labels_per_client_options) * len(selectors) * len(noises) * len(seeds)
     done = 0
     for n in populations:
         for m in selections:
             for split in split_modes:
                 for selector in selectors:
-                    for noise in noises:
-                        for seed in seeds:
-                            run_tag = f"N{n}_m{m}_{split}_{selector}_noise{noise}_seed{seed}"
-                            code, acc, out_tail, err_tail, metrics_path, final_path = run_case(
-                                {
-                                    "LOGICAL_CLIENT_COUNT": n,
-                                    "LOGICAL_SELECTED_PER_ROUND": m,
-                                    "PHYSICAL_CONTAINER_LIMIT": 2,
-                                    "LOGICAL_SPLIT_MODE": split,
-                                    "SELECTOR_MODE": selector,
-                                    "CORRELATION_NOISE_PCT": noise,
-                                    "EXPERIMENT_SEED": seed,
-                                    "NUM_ROUNDS": 50,
-                                    "USE_LOGICAL_SCHEDULING": True,
-                                },
-                                run_tag,
-                            )
-                            done += 1
-                            print(f"[suite] {done}/{total} N={n} m={m} split={split} selector={selector} noise={noise} seed={seed} rc={code} acc={acc}", flush=True)
-                            row = {
-                                "N": n,
-                                "m": m,
-                                "split_mode": split,
-                                "selector": selector,
-                                "noise_pct": noise,
-                                "seed": seed,
-                                "return_code": code,
-                                "awpsp_accuracy_last": acc,
-                                "stdout_tail": out_tail.replace("\n", "\\n"),
-                                "stderr_tail": err_tail.replace("\n", "\\n"),
-                                "metrics_path": metrics_path,
-                                "final_metrics_path": final_path,
-                            }
-                            rows.append(row)
-                            with OUT.open("a", newline="") as f:
-                                writer = csv.DictWriter(f, fieldnames=result_fields)
-                                writer.writerow(row)
+                for labels_per_client in labels_per_client_options:
+                    for selector in selectors:
+                        for noise in noises:
+                            for seed in seeds:
+                                run_tag = f"N{n}_m{m}_{split}_labels{labels_per_client}_{selector}_noise{noise}_seed{seed}"
+                                code, acc, out_tail, err_tail, metrics_path, final_path = run_case(
+                                    {
+                                        "LOGICAL_CLIENT_COUNT": n,
+                                        "LOGICAL_SELECTED_PER_ROUND": m,
+                                        "LOGICAL_LABELS_PER_CLIENT": labels_per_client,
+                                        "PHYSICAL_CONTAINER_LIMIT": 2,
+                                        "LOGICAL_SPLIT_MODE": split,
+                                        "SELECTOR_MODE": selector,
+                                        "CORRELATION_NOISE_PCT": noise,
+                                        "EXPERIMENT_SEED": seed,
+                                        "NUM_ROUNDS": 50,
+                                        "USE_LOGICAL_SCHEDULING": True,
+                                    },
+                                    run_tag,
+                                )
+                                done += 1
+                                print(f"[suite] {done}/{total} N={n} m={m} split={split} labels={labels_per_client} selector={selector} noise={noise} seed={seed} rc={code} acc={acc}", flush=True)
+                                row = {
+                                    "N": n,
+                                    "m": m,
+                                    "split_mode": split,
+                                    "labels_per_client": labels_per_client,
+                                    "selector": selector,
+                                    "noise_pct": noise,
+                                    "seed": seed,
+                                    "return_code": code,
+                                    "awpsp_accuracy_last": acc,
+                                    "stdout_tail": out_tail.replace("\n", "\\n"),
+                                    "stderr_tail": err_tail.replace("\n", "\\n"),
+                                    "metrics_path": metrics_path,
+                                    "final_metrics_path": final_path,
+                                }
+                                rows.append(row)
+                                with OUT.open("a", newline="") as f:
+                                    writer = csv.DictWriter(f, fieldnames=result_fields)
+                                    writer.writerow(row)
 
     grouped = {}
     for r in rows:
-        key = (r["N"], r["m"], r["split_mode"], r["selector"], r["noise_pct"])
+        key = (r["N"], r["m"], r["split_mode"], r["labels_per_client"], r["selector"], r["noise_pct"])
         grouped.setdefault(key, []).append(r["awpsp_accuracy_last"])
 
     with SUMMARY.open("w", newline="") as f:
-        fieldnames = ["N", "m", "split_mode", "selector", "noise_pct", "mean_awpsp_last", "ci95"]
+        fieldnames = ["N", "m", "split_mode", "labels_per_client", "selector", "noise_pct", "mean_awpsp_last", "ci95"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for (n, m, split, selector, noise), vals in grouped.items():
+        for (n, m, split, labels_per_client, selector, noise), vals in grouped.items():
             clean = [v for v in vals if isinstance(v, (float, int))]
             mean, ci = confidence_interval(clean)
             writer.writerow(
@@ -187,6 +192,7 @@ def run_suite():
                     "N": n,
                     "m": m,
                     "split_mode": split,
+                    "labels_per_client": labels_per_client,
                     "selector": selector,
                     "noise_pct": noise,
                     "mean_awpsp_last": mean,

@@ -352,6 +352,7 @@ def run_federated_training():
     # Oort-style selector state (utility/reward + exploration + duration penalty).
     oort_pull_count = defaultdict(int)
     oort_reward_ema = defaultdict(float)
+    oort_utility_ema = defaultdict(float)
     oort_duration_ema = defaultdict(lambda: 1.0)
     logical_loss_history_awpsp = defaultdict(list)
     logical_loss_history_psp = defaultdict(list)
@@ -398,9 +399,10 @@ def run_federated_training():
     surrogate_log = []
     awpsp_avg_within_class_log = []
     psp_avg_within_class_log = []
+    oort_avg_within_class_log = []
     awpsp_fairness_inter_class_log = []
     psp_fairness_inter_class_log = []
-
+    oort_fairness_inter_class_log = []
 
     # ---------------- Initialize models ----------------
 #    base_model = models.resnet18(weights=None)
@@ -510,13 +512,76 @@ def run_federated_training():
                     current_losses[logical_id] = avg_loss
                     history_map[logical_id].append(avg_loss)
 
-        per_class_vars = [float(np.var(v)) for v in class_losses.values() if v]
-        avg_within_class_var = float(sum(per_class_vars) / len(per_class_vars)) if per_class_vars else 0.0
+        # Match topology-side fairness computation semantics.
+        # 1) Per-class sample variance (ddof=1) when class has >1 samples, else 0.0
+        # 2) Inter-class fairness computed on class means with a minimum sample threshold
+        #    to avoid noisy single-sample classes.
+        MIN_SAMPLES_PER_CLASS = 2
 
-        class_means = [float(np.mean(v)) for v in class_losses.values() if v]
-        fairness_inter_class = float(np.var(class_means, ddof=0)) if class_means else 0.0
+        per_class_means = {}
+        per_class_vars = {}
+        per_class_counts = {}
+        for lbl, losses in class_losses.items():
+            cnt = len(losses)
+            per_class_counts[int(lbl)] = cnt
+            if cnt == 0:
+                continue
+            per_class_means[int(lbl)] = float(np.mean(losses))
+            if cnt > 1:
+                per_class_vars[int(lbl)] = float(np.var(losses, ddof=1))
+            else:
+                per_class_vars[int(lbl)] = 0.0
+
+        valid_class_means = [
+            mean
+            for lbl, mean in per_class_means.items()
+            if per_class_counts.get(lbl, 0) >= MIN_SAMPLES_PER_CLASS
+        ]
+
+        avg_within_class_var = float(np.mean(list(per_class_vars.values()))) if per_class_vars else 0.0
+        fairness_inter_class = float(np.var(valid_class_means, ddof=0)) if valid_class_means else 0.0
 
         return avg_within_class_var, fairness_inter_class
+
+
+    def compute_logical_oort_utilities(model, selected_ids):
+        """
+        Oort-style statistical utility proxy per logical client:
+        utility_k ~= sqrt(mean(loss^2)) on the logical client's label-conditioned slice.
+        """
+        eval_dataset = datasets.CIFAR10(
+            root='data/',
+            train=False,
+            download=False,
+            transform=shared_state.topology.transform,
+        )
+        targets = np.array(eval_dataset.targets)
+        criterion = torch.nn.CrossEntropyLoss(reduction="none")
+        model.eval()
+        utility_map = {}
+
+        with torch.no_grad():
+            for logical_id in selected_ids:
+                labels = logical_label_map.get(logical_id, [])
+                if not labels:
+                    continue
+                indices = np.where(np.isin(targets, labels))[0].tolist()
+                if not indices:
+                    continue
+
+                subset = torch.utils.data.Subset(eval_dataset, indices)
+                loader = torch.utils.data.DataLoader(subset, batch_size=64, shuffle=False)
+                sq_losses = []
+
+                for images, y in loader:
+                    outputs = model(images)
+                    losses = criterion(outputs, y.long())
+                    sq_losses.extend((losses ** 2).tolist())
+
+                if sq_losses:
+                    utility_map[logical_id] = float(math.sqrt(sum(sq_losses) / len(sq_losses)))
+
+        return utility_map
 
 
 
@@ -668,26 +733,27 @@ def run_federated_training():
                 logical_selected_awpsp = logical_client_ids[:logical_selected_per_round]
 
 
-            # OORT logical baseline
+            # OORT logical baseline (paper-inspired):
+            # score = (utility + exploration_bonus) * duration_penalty
             latencies = [
                 shared_state.topology.dht.table.get(pid, {}).get("latency", 0.0) or 0.0
                 for pid in physical_ids
             ]
             preferred_duration = float(np.percentile(latencies, 50)) if latencies else 1.0
             preferred_duration = max(preferred_duration, 1.0)
+            oort_alpha = 2.0
             oort_scores = {}
             for cid in logical_client_ids:
-                reward = oort_reward_ema[cid] if oort_pull_count[cid] > 0 else shared_state.topology.availability_predictor.predict(cid)
-                bonus = math.sqrt((2.0 * math.log(current_round + 2.0)) / (oort_pull_count[cid] + 1.0))
+                utility = oort_utility_ema[cid] if oort_pull_count[cid] > 0 else 0.0
+                bonus = math.sqrt((0.1 * math.log(current_round + 2.0)) / (oort_pull_count[cid] + 1.0))
                 duration = max(oort_duration_ema[cid], 1e-6)
                 duration_penalty = min(1.0, preferred_duration / duration)
-                oort_scores[cid] = (reward + 0.1 * bonus) * duration_penalty
+                oort_scores[cid] = (utility + bonus) * duration_penalty
             logical_selected_oort = sorted(
                 logical_client_ids,
                 key=lambda cid: oort_scores[cid],
                 reverse=True,
             )[:logical_selected_per_round]
-
 
             # PSP logical baseline
             logical_selected_psp = random.sample(
@@ -698,6 +764,7 @@ def run_federated_training():
             logical_selected_fair = logical_selected_awpsp
             logical_metrics_awpsp = compute_logical_label_metrics(logical_selected_awpsp)
             logical_metrics_psp = compute_logical_label_metrics(logical_selected_psp)
+            logical_metrics_oort = compute_logical_label_metrics(logical_selected_oort)
 
         num_corr_failed = sum(1 for _, failed_neighbors in correlated_failures if failed_neighbors)
         corr_failure_log.append((current_round, num_corr_failed))
@@ -771,7 +838,7 @@ def run_federated_training():
 
             avg_within_class_var, fairness_inter_class = compute_logical_model_loss_fairness(
                 awpsp_model,
-                selected_awpsp,,
+                selected_awpsp,
                 logical_loss_history_awpsp,
                 logical_client_ids,
             )
@@ -826,6 +893,7 @@ def run_federated_training():
 
         if use_logical_scheduling:
             selected_oort = logical_selected_oort
+            observed_oort_utilities = compute_logical_oort_utilities(oort_model, selected_oort)
             for logical_id in selected_oort:
                 logical_idx = int(str(logical_id).replace("h", "")) if str(logical_id).startswith("h") else 0
                 if physical_ids:
@@ -833,23 +901,25 @@ def run_federated_training():
                     mapped_latency = shared_state.topology.dht.table.get(mapped_pid, {}).get("latency", 1.0) or 1.0
                 else:
                     mapped_latency = 1.0
-                observed_reward = shared_state.topology.availability_predictor.predict(logical_id)
                 beta = 0.8
+                observed_reward = shared_state.topology.availability_predictor.predict(logical_id)
+                observed_utility = observed_oort_utilities.get(logical_id, 0.0)
                 oort_reward_ema[logical_id] = beta * oort_reward_ema[logical_id] + (1.0 - beta) * observed_reward
+                oort_utility_ema[logical_id] = beta * oort_utility_ema[logical_id] + (1.0 - beta) * observed_utility
                 oort_duration_ema[logical_id] = beta * oort_duration_ema[logical_id] + (1.0 - beta) * float(mapped_latency)
                 oort_pull_count[logical_id] += 1
             for logical_id in selected_oort:
                 logical_participation_oort[logical_id] += 1
-            oort_instant_var, oort_cumul_var = compute_logical_model_loss_fairness(
+            avg_within_class_var, fairness_inter_class = compute_logical_model_loss_fairness(
                 oort_model, selected_oort, logical_loss_history_oort, logical_client_ids
             )
-            _, oort_gini = compute_participation_stats(logical_participation_oort, logical_client_ids)
-            oort_metrics = compute_logical_label_metrics(selected_oort)
-            oort_covered_labels = oort_metrics["covered_labels"]
+            oort_instant_var = logical_metrics_oort["variance"]
+            oort_cumul_var, oort_gini = compute_participation_stats(logical_participation_oort, logical_client_ids)
+            oort_covered_labels = logical_metrics_oort["covered_labels"]
             oort_avg_score = float(len(selected_oort)) / float(max(1, logical_client_count))
-            oort_labels = oort_covered_labels
-            oort_KL = oort_metrics["kl"]
-            oort_unseen = oort_metrics["unseen"]
+            oort_labels = logical_metrics_oort["covered_labels"]
+            oort_KL = logical_metrics_oort["kl"]
+            oort_unseen = logical_metrics_oort["unseen"]
         else:
             selected_oort, oort_instant_var, oort_cumul_var, avg_within_class_var, fairness_inter_class, oort_covered_labels, oort_avg_score, oort_labels, oort_KL, oort_unseen, oort_gini =                 shared_state.topology.prioritize_available_nodes(
                     oort_model, current_round, correlated_failures, num_clients=5, label_map=label_map
@@ -877,6 +947,8 @@ def run_federated_training():
            oort_KL_log.append((current_round, oort_KL))
            oort_unseen_log.append((current_round, oort_unseen))
            oort_gini_log.append((current_round, oort_gini))
+           oort_avg_within_class_log.append(avg_within_class_var)
+           oort_fairness_inter_class_log.append(fairness_inter_class)
         else:
            print("⚠️ No updates received from clients. Skipping model update this round.")
 
@@ -970,18 +1042,30 @@ def run_federated_training():
             "PSP_avg_within_class",
             "PSP_fairness_inter_class",
             "PSP_CoveredLAbelsCount",
+            "OORT_Accuracy",
+            "OORT_instant_fairness",
+            "OORT_cumul_fairness",
+            "OORT_avg_within_class",
+            "OORT_fairness_inter_class",
+            "OORT_CoveredLabelsCount",
             "selected_awpsp",
             "selected_psp",
+            "selected_oort",
             "AWPSP Avg Score",
             "PSP Avg Score",
+            "OORT Avg Score",
             "AWPSP labels",
             "PSP labels",
+            "OORT labels",
             "AWPSP KL",
             "PSP KL",
+            "OORT KL",
             "AWPSP unseen",
             "PSP unseen",
+            "OORT unseen",
             "AWPSP gini",
             "PSP gini",
+            "OORT gini",
         ]
         metrics_mode = "w" if current_round == 0 else "a"
 
@@ -1009,27 +1093,40 @@ def run_federated_training():
                 awpsp_accuracy_log[-1][1] if awpsp_accuracy_log else None,
                 awpsp_instant_fairness_log[-1][1] if awpsp_instant_fairness_log else None,
                 awpsp_cumul_fairness_log[-1][1] if awpsp_cumul_fairness_log else None,
-                awpsp_avg_within_class_log[-1][1] if psp_cumul_fairness_log else None,
-                awpsp_fairness_inter_class_log[-1][1] if psp_instant_fairness_log else None,
+                awpsp_avg_within_class_log[-1] if awpsp_avg_within_class_log else None,
+                awpsp_fairness_inter_class_log[-1] if awpsp_fairness_inter_class_log else None,
                 corr_failure_log[-1][1] if corr_failure_log else None,
                 awpsp_covered_labels_log[-1][1] if awpsp_covered_labels_log else None,
                 psp_accuracy_log[-1][1] if psp_accuracy_log else None,
                 psp_instant_fairness_log[-1][1] if psp_instant_fairness_log else None,
-                psp_avg_within_class_log[-1][1] if psp_cumul_fairness_log else None,
-                psp_fairness_inter_class_log[-1][1] if psp_instant_fairness_log else None,
+                psp_cumul_fairness_log[-1][1] if psp_cumul_fairness_log else None,
+                psp_avg_within_class_log[-1] if psp_avg_within_class_log else None,
+                psp_fairness_inter_class_log[-1] if psp_fairness_inter_class_log else None,
                 psp_covered_labels_log[-1][1] if psp_covered_labels_log else None,
+                oort_accuracy_log[-1][1] if oort_accuracy_log else None,
+                oort_instant_fairness_log[-1][1] if oort_instant_fairness_log else None,
+                oort_cumul_fairness_log[-1][1] if oort_cumul_fairness_log else None,
+                oort_avg_within_class_log[-1] if oort_avg_within_class_log else None,
+                oort_fairness_inter_class_log[-1] if oort_fairness_inter_class_log else None,
+                oort_covered_labels_log[-1][1] if oort_covered_labels_log else None,
                 selected_awpsp_log[-1][1] if selected_awpsp_log else None,
                 selected_psp_log[-1][1] if selected_psp_log else None,
+                selected_oort_log[-1][1] if selected_oort_log else None,
                 awpsp_avg_score_log[-1][1] if awpsp_avg_score_log else None,
                 psp_avg_score_log[-1][1] if psp_avg_score_log else None,
+                oort_avg_score_log[-1][1] if oort_avg_score_log else None,
                 awpsp_labels_log[-1][1] if awpsp_labels_log else None,
                 psp_labels_log[-1][1] if psp_labels_log else None,
+                oort_labels_log[-1][1] if oort_labels_log else None,
                 awpsp_KL_log[-1][1] if awpsp_KL_log else None,
                 psp_KL_log[-1][1] if psp_KL_log else None,
+                oort_KL_log[-1][1] if oort_KL_log else None,
                 awpsp_unseen_log[-1][1] if awpsp_unseen_log else None,
                 psp_unseen_log[-1][1] if psp_unseen_log else None,
+                oort_unseen_log[-1][1] if oort_unseen_log else None,
                 awpsp_gini_log[-1][1] if awpsp_gini_log else None,
                 psp_gini_log[-1][1] if psp_gini_log else None,
+                oort_gini_log[-1][1] if oort_gini_log else None,
             ])
 
         summary = compute_final_metrics(base_model, current_round)

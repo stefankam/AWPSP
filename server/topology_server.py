@@ -291,11 +291,13 @@ class TopologyProvider:
     def run_federated_round(self, selected_hosts, global_weights, model=None):
         updated_weights = []
         print("selected_hosts: ", selected_hosts)
-        if use_selected_nodes and selected_nodes:
-            # Keep selected-node global accuracy consistent with per-client aggregation (macro-average).
-            per_client = self.evaluate_per_client_accuracy(model, selected_nodes, use_unseen_test=True)
-            values = [v for v in per_client.values() if v is not None]
-            return (sum(values) / len(values)) if values else 0.0
+        for host in selected_hosts:
+            client_weights = self.send_weights_to_client(host, global_weights)
+            if client_weights is not None:
+                updated_weights.append(client_weights)
+
+        return self.aggregate_weights(updated_weights)
+
 
     def aggregate_weights(self, weighted_list):
         # Filter out None entries
