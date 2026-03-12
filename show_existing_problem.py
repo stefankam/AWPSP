@@ -601,34 +601,51 @@ class TopologyProvider:
        return active_hosts
 
 
-    def simulate_failures(self, availability_vectors, corr_threshold=0.8, fail_prob=0.3, failure_mode = "random", label_map = None):
+    def simulate_failures(
+        self,
+        availability_vectors,
+        corr_threshold=0.8,
+        fail_prob=0.3,
+        failure_mode="random",
+        label_map=None,
+        num_trials=1,
+    ):
        """Evaluate classification accuracy using available hosts."""
        print("🔎 Starting Failure Simulation: Mode =", failure_mode)
 
-       # Evaluate classification accuracy over available (non-failed) hosts
-       active_hosts = self.simulate_active_hosts(availability_vectors, corr_threshold=corr_threshold, fail_prob=fail_prob, failure_mode = failure_mode)
-       print(f"Active Hosts: {[h.name for h in active_hosts]}")
-       print(f"Failed Hosts: {self.failed_nodes}")
+       if num_trials < 1:
+           raise ValueError("num_trials must be >= 1")
 
-       if not active_hosts:
-         print("⚠️ All nodes failed. Cannot evaluate.")
-         return 0.0
+       trial_accuracies = []
 
-       correct_predictions = 0
-       total_predictions = 0
+       for trial in range(num_trials):
+           print(f"\n🧪 Trial {trial + 1}/{num_trials}")
+           # Evaluate classification accuracy over available (non-failed) hosts
+           active_hosts = self.simulate_active_hosts(
+               availability_vectors,
+               corr_threshold=corr_threshold,
+               fail_prob=fail_prob,
+               failure_mode=failure_mode,
+           )
+           print(f"Active Hosts: {[h.name for h in active_hosts]}")
+           print(f"Failed Hosts: {self.failed_nodes}")
 
-       # Evaluate model accuracy with respect to class presence
-       accuracy = self.evaluate_accuracy(active_hosts, self.sample_images, label_map)
+           if not active_hosts:
+               print("⚠️ All nodes failed. Cannot evaluate.")
+               trial_accuracies.append(0.0)
+               continue
 
-      # with torch.no_grad():
-       #  for host, (image, label) in zip(active_hosts, self.sample_images):
-        #    predicted = host.predict_failure(image)
-         #   correct_predictions += (predicted == label).sum().item()
-          #  total_predictions += label.size(0)
+           # Evaluate model accuracy with respect to class presence
+           accuracy = self.evaluate_accuracy(active_hosts, self.sample_images, label_map)
+           trial_accuracies.append(accuracy)
 
-      # accuracy = (correct_predictions / total_predictions) * 100    
-      # print(f"📊 System Accuracy (excluding failed nodes): {accuracy:.2f}%")
-       return accuracy
+       mean_accuracy = float(np.mean(trial_accuracies)) if trial_accuracies else 0.0
+       std_accuracy = float(np.std(trial_accuracies)) if trial_accuracies else 0.0
+       print(
+           f"📊 Averaged System Accuracy over {num_trials} trial(s): "
+           f"{mean_accuracy:.2f}% ± {std_accuracy:.2f}"
+       )
+       return mean_accuracy
 
 
     def evaluate_accuracy(self, active_hosts, sample_images, label_map):
@@ -721,6 +738,7 @@ if __name__ == "__main__":
 
     corr_thresholds = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     fail_probs = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    num_trials = 5
     availability_vectors = topology.extract_availability_vectors()
     label_map = topology.assign_labels_to_workers(labels_per_worker=1)
     row1 = []
@@ -732,10 +750,11 @@ if __name__ == "__main__":
             corr_threshold=0.6,
             fail_prob=fp,
             failure_mode="random",  # or "random" or "correlated"
-            label_map = label_map
+            label_map=label_map,
+            num_trials=num_trials,
         )
         row1.append(acc)
-    print("Running for fail_prob=[0.1, 0.3, 0.5, 0.7]", row1)
+    print(f"Running averaged accuracies for fail_prob with {num_trials} trials", row1)
      
     for corr_th in corr_thresholds:
         acc = topology.simulate_failures(
@@ -743,9 +762,10 @@ if __name__ == "__main__":
             corr_threshold=corr_th,
             fail_prob=0.1,
             failure_mode="correlated",  # or "random" or "correlated"
-            label_map = label_map
+            label_map = label_map,
+            num_trials=num_trials,
         )
         row2.append(acc)
-    print("Running for corr_thresholds = [0.6, 0.7, 0.8, 0.9]", row2)
+    print(f"Running averaged accuracies for corr_thresholds with {num_trials} trials", row2)
 
     topology.cleanup()
