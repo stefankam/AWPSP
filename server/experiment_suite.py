@@ -110,11 +110,11 @@ def run_case(env_overrides, run_tag):
 def run_suite():
     print(f"[suite] ROOT={ROOT} MAIN_SERVER={MAIN_SERVER}", flush=True)
     populations = [100, 300, 1000, 3000]
-    selections = [10, 20, 50, 100]
-    split_modes = ["overlap", "dirichlet"]
-    labels_per_client_options = [2, 5, 10]
+    selections = [10]
+    split_modes = ["overlap"]
+    labels_per_client_options = [5,10]
     selectors = ["awpsp"]
-    noises = [0, 10, 20, 40]
+    noises = [0]
     seeds = [0]
 
     rows = []
@@ -132,7 +132,6 @@ def run_suite():
     for n in populations:
         for m in selections:
             for split in split_modes:
-                for selector in selectors:
                 for labels_per_client in labels_per_client_options:
                     for selector in selectors:
                         for noise in noises:
@@ -143,7 +142,7 @@ def run_suite():
                                         "LOGICAL_CLIENT_COUNT": n,
                                         "LOGICAL_SELECTED_PER_ROUND": m,
                                         "LOGICAL_LABELS_PER_CLIENT": labels_per_client,
-                                        "PHYSICAL_CONTAINER_LIMIT": 2,
+                                        "PHYSICAL_CONTAINER_LIMIT": 10,
                                         "LOGICAL_SPLIT_MODE": split,
                                         "SELECTOR_MODE": selector,
                                         "CORRELATION_NOISE_PCT": noise,

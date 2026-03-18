@@ -93,7 +93,7 @@ class TopologyProvider:
             lr=0.001,
         )
 
-    def get_subset_indices(self, worker_name, dataset, subset_size=1000,  seed=42):
+    def get_subset_indices(self, worker_name, dataset, subset_size=1000,  seed=42, labels_per_client=None):
         """
         Return non-IID training data indices per worker (by label).
         """
@@ -106,9 +106,9 @@ class TopologyProvider:
         # get all indices
 #        all_indices = list(range(total_size))
 
-        # Assign 2 labels per client (you can change this)
         
-        num_labels_per_worker = 2
+        # Keep logical-client label cardinality aligned with the coordinator request.
+        num_labels_per_worker = int(labels_per_client if labels_per_client is not None else os.getenv("LOGICAL_LABELS_PER_CLIENT", "2"))
         total_labels = 10
 
         start = (index * num_labels_per_worker) % total_labels
@@ -211,26 +211,26 @@ class TopologyProvider:
         return self.get_or_create_loader(worker_name, subset_size=subset_size, dataset=full_dataset)
 
 
-    def get_or_create_loader(self, logical_id, subset_size=1000, dataset=None):
+    def get_or_create_loader(self, logical_id, subset_size=1000, dataset=None, labels_per_client=None):
         if not hasattr(self, "loader_cache"):
             self.loader_cache = {}
-        if logical_id in self.loader_cache:
-            return self.loader_cache[logical_id]
+        cache_key = (logical_id, labels_per_client)
+        if cache_key in self.loader_cache:
+            return self.loader_cache[cache_key]
         full_dataset = dataset or datasets.CIFAR10(
             root='data/', train=True, download=True, transform=self.transform
         )
-        indices = self.get_subset_indices(logical_id, full_dataset, subset_size)
+        indices = self.get_subset_indices(logical_id, full_dataset, subset_size, labels_per_client=labels_per_client)
         print(f"client is: {logical_id}")
         print(f"client label indices are: {indices}")
         indices = np.array(indices)
         full_dataset.data = full_dataset.data[indices]
         full_dataset.targets = [full_dataset.targets[i] for i in indices]
         train_loader = DataLoader(full_dataset, batch_size=32, shuffle=False)
-        self.loader_cache[logical_id] = train_loader
+        self.loader_cache[cache_key] = train_loader
         return train_loader
 
-
-    def run_local_training(self, global_weights, local_epochs=5, logical_id=None):
+    def run_local_training(self, global_weights, local_epochs=5, logical_id=None, logical_labels_per_client=None):
         """Train locally using persistent model/optimizer."""
         if global_weights is not None:
            # Merge global weights with local model instead of full overwrite
@@ -242,7 +242,7 @@ class TopologyProvider:
 
         loader = self.cifar_loader
         if logical_id:
-            loader = self.get_or_create_loader(logical_id)
+            loader = self.get_or_create_loader(logical_id, labels_per_client=logical_labels_per_client)
 
         # Training loop
         for epoch in range(local_epochs): 

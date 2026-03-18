@@ -351,7 +351,6 @@ def run_federated_training():
     logical_participation_log = defaultdict(int)
     # Oort-style selector state (utility/reward + exploration + duration penalty).
     oort_pull_count = defaultdict(int)
-    oort_reward_ema = defaultdict(float)
     oort_utility_ema = defaultdict(float)
     oort_duration_ema = defaultdict(lambda: 1.0)
     logical_loss_history_awpsp = defaultdict(list)
@@ -820,16 +819,14 @@ def run_federated_training():
             for logical_id in selected_awpsp:
                 logical_participation_awpsp[logical_id] += 1
                 if selector_mode == "oort":
-                    # Online update for Oort-style reward/duration stats.
+                    # Online update for Oort-style utility/duration stats.
                     logical_idx = int(str(logical_id).replace("h", "")) if str(logical_id).startswith("h") else 0
                     if physical_ids:
                         mapped_pid = physical_ids[logical_idx % len(physical_ids)]
                         mapped_latency = shared_state.topology.dht.table.get(mapped_pid, {}).get("latency", 1.0) or 1.0
                     else:
                         mapped_latency = 1.0
-                    observed_reward = shared_state.topology.availability_predictor.predict(logical_id)
                     beta = 0.8
-                    oort_reward_ema[logical_id] = beta * oort_reward_ema[logical_id] + (1.0 - beta) * observed_reward
                     oort_duration_ema[logical_id] = beta * oort_duration_ema[logical_id] + (1.0 - beta) * float(mapped_latency)
                     oort_pull_count[logical_id] += 1
 
@@ -902,9 +899,7 @@ def run_federated_training():
                 else:
                     mapped_latency = 1.0
                 beta = 0.8
-                observed_reward = shared_state.topology.availability_predictor.predict(logical_id)
                 observed_utility = observed_oort_utilities.get(logical_id, 0.0)
-                oort_reward_ema[logical_id] = beta * oort_reward_ema[logical_id] + (1.0 - beta) * observed_reward
                 oort_utility_ema[logical_id] = beta * oort_utility_ema[logical_id] + (1.0 - beta) * observed_utility
                 oort_duration_ema[logical_id] = beta * oort_duration_ema[logical_id] + (1.0 - beta) * float(mapped_latency)
                 oort_pull_count[logical_id] += 1
@@ -921,7 +916,7 @@ def run_federated_training():
             oort_KL = logical_metrics_oort["kl"]
             oort_unseen = logical_metrics_oort["unseen"]
         else:
-            selected_oort, oort_instant_var, oort_cumul_var, avg_within_class_var, fairness_inter_class, oort_covered_labels, oort_avg_score, oort_labels, oort_KL, oort_unseen, oort_gini =                 shared_state.topology.prioritize_available_nodes(
+            selected_oort, oort_instant_var, oort_cumul_var, avg_within_class_var, fairness_inter_class, oort_covered_labels, oort_avg_score, oort_labels, oort_KL, oort_unseen, oort_gini = shared_state.topology.select_oort_nodes(
                     oort_model, current_round, correlated_failures, num_clients=5, label_map=label_map
                 )
         oort_covered_labels_log.append((current_round, len(oort_covered_labels)))
@@ -937,7 +932,7 @@ def run_federated_training():
         if weights_oort is not None:
            current_weights_oort = weights_oort
            oort_model.load_state_dict(current_weights_oort)
-           accuracy_oort = shared_state.topology.evaluate_global_model(oort_model, selected_nodes=selected_oort, use_selected_nodes=True, physical_ids=physical_ids if use_logical_scheduling else None)
+           accuracy_oort = shared_state.topology.evaluate_global_model(oort_model, selected_nodes=selected_oort, use_selected_nodes=False, physical_ids=physical_ids if use_logical_scheduling else None)
            oort_accuracy_log.append((current_round, accuracy_oort))
            oort_instant_fairness_log.append((current_round, oort_instant_var))
            oort_cumul_fairness_log.append((current_round, oort_cumul_var))
