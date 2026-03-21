@@ -112,7 +112,7 @@ def run_suite():
     populations = [100, 300, 1000, 3000]
     selections = [10]
     split_modes = ["overlap"]
-    labels_per_client_options = [5,10]
+    labels_per_client_options = [2,5,10]
     selectors = ["awpsp"]
     noises = [0]
     seeds = [0]

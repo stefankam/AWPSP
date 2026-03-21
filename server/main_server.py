@@ -12,6 +12,7 @@ import random
 import json
 import numpy as np
 from typing import Dict, Tuple
+from types import SimpleNamespace
 from collections import defaultdict
 from torchvision import models
 from shared_state import topology
@@ -21,6 +22,8 @@ import socket
 from topology_server import TopologyProvider
 import shared_state
 from availability import extract_availability_vectors
+from oort.oort import create_training_selector
+
 
 def read_proc_stat() -> Tuple[int, int]:
     with open("/proc/stat", "r") as f:
@@ -309,6 +312,23 @@ def apply_correlation_noise(correlated_failures, node_pool, noise_pct=0.0, seed=
 
 
 
+def build_oort_args():
+    return SimpleNamespace(
+        exploration_factor=float(os.getenv("OORT_EXPLORATION_FACTOR", "0.9")),
+        exploration_decay=float(os.getenv("OORT_EXPLORATION_DECAY", "0.98")),
+        exploration_min=float(os.getenv("OORT_EXPLORATION_MIN", "0.1")),
+        exploration_alpha=float(os.getenv("OORT_EXPLORATION_ALPHA", "0.3")),
+        round_threshold=float(os.getenv("OORT_ROUND_THRESHOLD", "50")),
+        sample_window=float(os.getenv("OORT_SAMPLE_WINDOW", "5.0")),
+        pacer_step=int(os.getenv("OORT_PACER_STEP", "20")),
+        pacer_delta=float(os.getenv("OORT_PACER_DELTA", "5")),
+        blacklist_rounds=int(os.getenv("OORT_BLACKLIST_ROUNDS", "-1")),
+        blacklist_max_len=float(os.getenv("OORT_BLACKLIST_MAX_LEN", "0.5")),
+        clip_bound=float(os.getenv("OORT_CLIP_BOUND", "0.95")),
+        round_penalty=float(os.getenv("OORT_ROUND_PENALTY", "2.0")),
+        cut_off_util=float(os.getenv("OORT_CUTOFF_UTIL", "0.95")),
+    )
+
 
 
 def run_federated_training():
@@ -423,6 +443,19 @@ def run_federated_training():
         dirichlet_alpha=dirichlet_alpha,
         seed=seed,
     )
+
+
+
+    logical_oort_selector = create_training_selector(build_oort_args())
+    logical_oort_selector_id_to_client = {}
+    logical_oort_client_to_selector_id = {}
+    for idx in range(logical_client_count):
+        logical_id = f"h{idx}"
+        selector_id = str(idx)
+        logical_oort_selector_id_to_client[selector_id] = logical_id
+        logical_oort_client_to_selector_id[logical_id] = selector_id
+        logical_oort_selector.register_client(selector_id, {"reward": 0.0, "duration": 1.0, "status": True})
+
 
     def compute_logical_label_metrics(selected_ids):
         total_labels = 10
@@ -705,54 +738,35 @@ def run_federated_training():
             prioritized = [n for n in priority_nodes if n in physical_ids]
             physical_ids = prioritized + [n for n in physical_ids if n not in prioritized]
 
-            # Build logical selection from prioritized physical order (no separate logical scoring).
-            logical_selected_awpsp = []
-            if physical_ids:
-                bucket_count = len(physical_ids)
-                logical_buckets = [[] for _ in range(bucket_count)]
-                for idx, cid in enumerate(logical_client_ids):
-                    logical_buckets[idx % bucket_count].append(cid)
+            logical_selected_awpsp, *_ = shared_state.topology.prioritize_available_nodes(
+                awpsp_priority_model,
+                current_round,
+                correlated_failures,
+                num_clients=logical_selected_per_round,
+                label_map=logical_label_map,
+                candidate_ids=logical_client_ids,
+            )
 
-                slot_order = list(range(bucket_count))
-                bucket_ptrs = [0] * bucket_count
+            feasible_logical_selector_ids = set()
+            for logical_id in logical_client_ids:
+                selector_id = logical_oort_client_to_selector_id[logical_id]
+                logical_idx = int(str(logical_id).replace("h", "")) if str(logical_id).startswith("h") else 0
+                mapped_latency = 1.0
+                if physical_ids:
+                    mapped_pid = physical_ids[logical_idx % len(physical_ids)]
+                    mapped_latency = shared_state.topology.dht.table.get(mapped_pid, {}).get("latency", 1.0) or 1.0
+                logical_oort_selector.update_duration(selector_id, float(mapped_latency))
+                feasible_logical_selector_ids.add(int(selector_id))
 
-                while len(logical_selected_awpsp) < logical_selected_per_round:
-                    progressed = False
-                    for slot in slot_order:
-                        ptr = bucket_ptrs[slot]
-                        if ptr < len(logical_buckets[slot]):
-                            logical_selected_awpsp.append(logical_buckets[slot][ptr])
-                            bucket_ptrs[slot] += 1
-                            progressed = True
-                            if len(logical_selected_awpsp) >= logical_selected_per_round:
-                                break
-                    if not progressed:
-                        break
-            else:
-                logical_selected_awpsp = logical_client_ids[:logical_selected_per_round]
-
-
-            # OORT logical baseline (paper-inspired):
-            # score = (utility + exploration_bonus) * duration_penalty
-            latencies = [
-                shared_state.topology.dht.table.get(pid, {}).get("latency", 0.0) or 0.0
-                for pid in physical_ids
+            selected_oort_selector_ids = logical_oort_selector.select_participant(
+                min(logical_selected_per_round, len(feasible_logical_selector_ids)),
+                feasible_clients=feasible_logical_selector_ids,
+            ) if feasible_logical_selector_ids else []
+            logical_selected_oort = [
+                logical_oort_selector_id_to_client[sid]
+                for sid in selected_oort_selector_ids
+                if sid in logical_oort_selector_id_to_client
             ]
-            preferred_duration = float(np.percentile(latencies, 50)) if latencies else 1.0
-            preferred_duration = max(preferred_duration, 1.0)
-            oort_alpha = 2.0
-            oort_scores = {}
-            for cid in logical_client_ids:
-                utility = oort_utility_ema[cid] if oort_pull_count[cid] > 0 else 0.0
-                bonus = math.sqrt((0.1 * math.log(current_round + 2.0)) / (oort_pull_count[cid] + 1.0))
-                duration = max(oort_duration_ema[cid], 1e-6)
-                duration_penalty = min(1.0, preferred_duration / duration)
-                oort_scores[cid] = (utility + bonus) * duration_penalty
-            logical_selected_oort = sorted(
-                logical_client_ids,
-                key=lambda cid: oort_scores[cid],
-                reverse=True,
-            )[:logical_selected_per_round]
 
             # PSP logical baseline
             logical_selected_psp = random.sample(
@@ -818,18 +832,6 @@ def run_federated_training():
             selected_awpsp = logical_selected_awpsp
             for logical_id in selected_awpsp:
                 logical_participation_awpsp[logical_id] += 1
-                if selector_mode == "oort":
-                    # Online update for Oort-style utility/duration stats.
-                    logical_idx = int(str(logical_id).replace("h", "")) if str(logical_id).startswith("h") else 0
-                    if physical_ids:
-                        mapped_pid = physical_ids[logical_idx % len(physical_ids)]
-                        mapped_latency = shared_state.topology.dht.table.get(mapped_pid, {}).get("latency", 1.0) or 1.0
-                    else:
-                        mapped_latency = 1.0
-                    beta = 0.8
-                    oort_duration_ema[logical_id] = beta * oort_duration_ema[logical_id] + (1.0 - beta) * float(mapped_latency)
-                    oort_pull_count[logical_id] += 1
-
             awpsp_instant_var = logical_metrics_awpsp["variance"]
             awpsp_cumul_var, awpsp_gini = compute_participation_stats(logical_participation_awpsp, logical_client_ids)
 
@@ -899,10 +901,18 @@ def run_federated_training():
                 else:
                     mapped_latency = 1.0
                 beta = 0.8
-                observed_utility = observed_oort_utilities.get(logical_id, 0.0)
+                observed_utility = float(observed_oort_utilities.get(logical_id, 0.0))
                 oort_utility_ema[logical_id] = beta * oort_utility_ema[logical_id] + (1.0 - beta) * observed_utility
                 oort_duration_ema[logical_id] = beta * oort_duration_ema[logical_id] + (1.0 - beta) * float(mapped_latency)
                 oort_pull_count[logical_id] += 1
+                selector_id = logical_oort_client_to_selector_id.get(logical_id)
+                if selector_id is not None:
+                    logical_oort_selector.update_client_util(selector_id, {
+                        "reward": observed_utility,
+                        "duration": float(mapped_latency),
+                        "time_stamp": current_round + 1,
+                        "status": True,
+                    })
             for logical_id in selected_oort:
                 logical_participation_oort[logical_id] += 1
             avg_within_class_var, fairness_inter_class = compute_logical_model_loss_fairness(

@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import hashlib
 from collections import defaultdict
+from types import SimpleNamespace
 import time
 import torch
 import torchvision.models as models
@@ -28,9 +29,28 @@ import random
 import json
 import time
 from torchvision import datasets
+from oort.oort import create_training_selector
 from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 from torch.utils.data import ConcatDataset
+
+
+def build_oort_args():
+    return SimpleNamespace(
+        exploration_factor=float(os.getenv("OORT_EXPLORATION_FACTOR", "0.9")),
+        exploration_decay=float(os.getenv("OORT_EXPLORATION_DECAY", "0.98")),
+        exploration_min=float(os.getenv("OORT_EXPLORATION_MIN", "0.1")),
+        exploration_alpha=float(os.getenv("OORT_EXPLORATION_ALPHA", "0.3")),
+        round_threshold=float(os.getenv("OORT_ROUND_THRESHOLD", "50")),
+        sample_window=float(os.getenv("OORT_SAMPLE_WINDOW", "5.0")),
+        pacer_step=int(os.getenv("OORT_PACER_STEP", "20")),
+        pacer_delta=float(os.getenv("OORT_PACER_DELTA", "5")),
+        blacklist_rounds=int(os.getenv("OORT_BLACKLIST_ROUNDS", "-1")),
+        blacklist_max_len=float(os.getenv("OORT_BLACKLIST_MAX_LEN", "0.5")),
+        clip_bound=float(os.getenv("OORT_CLIP_BOUND", "0.95")),
+        round_penalty=float(os.getenv("OORT_ROUND_PENALTY", "2.0")),
+        cut_off_util=float(os.getenv("OORT_CUTOFF_UTIL", "0.95")),
+    )
 
 class TopologyProvider:
     def __init__(self, device_names, num_epochs, link_latency=None, link_loss=None, model_name='resnet', device_registry=None):
@@ -60,6 +80,15 @@ class TopologyProvider:
         self.oort_pull_count = defaultdict(int)
         self.oort_utility_ema = defaultdict(float)
         self.oort_duration_ema = defaultdict(lambda: 1.0)
+        self.oort_args = build_oort_args()
+        self.oort_selector = create_training_selector(self.oort_args)
+        self.oort_selector_id_to_node = {}
+        self.oort_node_to_selector_id = {}
+        for idx, node in enumerate(self.devices):
+            selector_id = str(idx)
+            self.oort_selector_id_to_node[selector_id] = node
+            self.oort_node_to_selector_id[node] = selector_id
+            self.oort_selector.register_client(selector_id, {"reward": 0.0, "duration": 1.0, "status": True})
         self.last_model_states = {}  # node_id → (model_state_dict, round_number)
         self.surrogate_contributions = defaultdict(int)
         self.surrogate_staleness = defaultdict(int)
@@ -964,7 +993,7 @@ class TopologyProvider:
         return selected, instant_fairness_variance, cumulative_fairness_variance, avg_within_class_var, fairness_inter_class, covered_labels, avg_sel_score, np.sum(class_counts>0), kl, unseen_rate, gini
 
 
-    def prioritize_available_nodes(self, model, current_round, correlated_failures, num_clients, label_map):
+    def prioritize_available_nodes(self, model, current_round, correlated_failures, num_clients, label_map, candidate_ids=None):
         """
         Select a subset of active nodes prioritizing:
         - DHT availability and freshness
@@ -972,6 +1001,44 @@ class TopologyProvider:
         """
         # Ensure inference path uses BN running stats even for tiny batches.
         model.eval()
+
+        if candidate_ids is not None:
+            base_scores = {
+                node: float(self.get_freshness(node, current_round))
+                for node in candidate_ids
+            }
+
+            selected = []
+            covered_labels = set()
+            sel_scores = []
+            remaining = list(candidate_ids)
+            target = min(num_clients, len(candidate_ids))
+
+            while remaining and len(selected) < target:
+                best_node = None
+                best_key = None
+                for node in remaining:
+                    labels = set(label_map.get(node, []))
+                    new_label_gain = len(labels - covered_labels)
+                    key = (new_label_gain, base_scores[node], node)
+                    if best_key is None or key > best_key:
+                        best_key = key
+                        best_node = node
+
+                if best_node is None:
+                    break
+
+                selected.append(best_node)
+                sel_scores.append(base_scores[best_node])
+                covered_labels.update(label_map.get(best_node, []))
+                remaining.remove(best_node)
+
+            self.total_rounds_elapsed += 1
+            self.update_participation_log(selected, current_round)
+
+            avg_sel_score = float(np.mean(sel_scores)) if sel_scores else 0.0
+            return selected, 0.0, 0.0, 0.0, 0.0, covered_labels, avg_sel_score, len(covered_labels), 0.0, 0.0, 0.0
+
 
         # 1. Get active nodes
         correlated_nodes = {n for pair in correlated_failures for n in pair}
@@ -1245,11 +1312,8 @@ class TopologyProvider:
 
     def select_oort_nodes(self, model, current_round, correlated_failures, num_clients, label_map, exploration_coeff=0.1, ema_beta=0.8):
         """
-        Oort-style physical selector:
-        - utility + exploration bonus
-        - duration-aware penalty (prefer faster clients)
+        Oort-style physical selector driven by the vendored Oort training selector.
         """
-        # Ensure inference path uses BN running stats even for tiny batches.
         model.eval()
 
         correlated_nodes = {n for pair in correlated_failures for n in pair}
@@ -1258,24 +1322,24 @@ class TopologyProvider:
             if node not in self.failed_nodes and node not in correlated_nodes and node not in self.probation_rounds
         ]
 
-        active_latencies = [
-            float(self.dht.table.get(node, {}).get("latency", 1.0) or 1.0)
-            for node in active_hosts
-        ]
-        preferred_duration = float(np.percentile(active_latencies, 50)) if active_latencies else 1.0
-        preferred_duration = max(preferred_duration, 1.0)
-
-        scores = []
+        feasible_selector_ids = set()
         for node in active_hosts:
-            utility = self.oort_utility_ema[node] if self.oort_pull_count[node] > 0 else 0.0
-            bonus = math.sqrt((exploration_coeff * math.log(current_round + 2.0)) / (self.oort_pull_count[node] + 1.0))
-            duration = max(self.oort_duration_ema[node], 1e-6)
-            duration_penalty = min(1.0, preferred_duration / duration)
-            score = (utility + bonus) * duration_penalty
-            scores.append((node, score))
+            selector_id = self.oort_node_to_selector_id.get(node)
+            if selector_id is None:
+                continue
+            feasible_selector_ids.add(int(selector_id))
+            latency = float(self.dht.table.get(node, {}).get("latency", 1.0) or 1.0)
+            self.oort_selector.update_duration(selector_id, latency)
 
-        scores.sort(key=lambda x: x[1], reverse=True)
-        selected = [node for node, _ in scores[: min(num_clients, len(scores))]]
+        selected_selector_ids = self.oort_selector.select_participant(
+            min(num_clients, len(feasible_selector_ids)),
+            feasible_clients=feasible_selector_ids,
+        ) if feasible_selector_ids else []
+        selected = [
+            self.oort_selector_id_to_node[sid]
+            for sid in selected_selector_ids
+            if sid in self.oort_selector_id_to_node
+        ]
 
         covered_labels = set()
         for node in selected:
@@ -1320,11 +1384,22 @@ class TopologyProvider:
                 self.node_losses.setdefault(node, []).append(avg_loss)
 
                 prev = self.previous_losses.get(node, None)
+                reward = 0.0
                 if prev is not None:
-                    delta_f = max(0, prev - avg_loss)
-                    self.utility_log[node] += delta_f
-                    self.oort_utility_ema[node] = ema_beta * self.oort_utility_ema[node] + (1.0 - ema_beta) * float(delta_f)
+                    reward = max(0, prev - avg_loss)
+                    self.utility_log[node] += reward
+                    self.oort_utility_ema[node] = ema_beta * self.oort_utility_ema[node] + (1.0 - ema_beta) * float(reward)
                 self.previous_losses[node] = avg_loss
+
+                selector_id = self.oort_node_to_selector_id.get(node)
+                latency = float(self.dht.table.get(node, {}).get("latency", 1.0) or 1.0)
+                if selector_id is not None:
+                    self.oort_selector.update_client_util(selector_id, {
+                        "reward": float(reward),
+                        "duration": latency,
+                        "time_stamp": current_round + 1,
+                        "status": True,
+                    })
 
             latency = float(self.dht.table.get(node, {}).get("latency", 1.0) or 1.0)
             self.oort_duration_ema[node] = ema_beta * self.oort_duration_ema[node] + (1.0 - ema_beta) * latency

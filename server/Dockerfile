@@ -33,6 +33,7 @@ WORKDIR /app
 COPY main_server.py .
 COPY requirements.txt .
 COPY traces/ traces/
+COPY oort/ oort/
 COPY topology_server.py .
 COPY shared_state.py .	
 COPY availability.py .
