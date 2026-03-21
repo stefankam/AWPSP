@@ -1,4 +1,8 @@
 import sys
+import csv
+import json
+import os
+from pathlib import Path
 sys.path.append('/home/skb67/.local/lib/python3.10/site-packages/')
 import re
 import time
@@ -17,6 +21,8 @@ import random
 from mininet.net import Mininet
 from mininet.node import Host, OVSSwitch, OVSController
 from mininet.link import TCLink
+from mininet.clean import cleanup as mininet_cleanup
+import socket
 import time
 from torchvision import datasets
 from torch.utils.data import DataLoader
@@ -176,6 +182,7 @@ class TopologyProvider:
         num_workers,                    # required
         model_name,                     # required
         num_epochs,                     # required
+        labels_per_worker=1,            # optional, default one label per worker
         link_latency=None,              # optional, default no latency
         link_loss=None,                 # optional, default no packet loss
         failure_probability=0.0,        # optional, default no failure
@@ -191,6 +198,7 @@ class TopologyProvider:
         self.host_num = 0
         self.num_epochs = num_epochs
         self.model_name = model_name
+        self.labels_per_worker = labels_per_worker
         self.sample_images = []
         self.transform = self.get_transform() 
         self.cifar_loader = self.load_cifar_data()
@@ -214,9 +222,10 @@ class TopologyProvider:
          print(f"📦 Worker {worker_name} assigned labels: {assigned}")
        return assignments
 
-    def load_dnn_model(self, train_loader, max_samples=20):
+    def load_dnn_model(self, train_loader=None, max_samples=20):
         """Load the DNN model for failure prediction."""
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.sample_images = []
 
         # Data loading (make sure the transform matches for both training and evaluation)
         transform = transforms.Compose([
@@ -228,7 +237,7 @@ class TopologyProvider:
         full_dataset = datasets.CIFAR10(root='/home/skb67/sim_fed_dht/data', train=True, download=True, transform=transform)
 
         # Assign labels to workers and build a combined subset of all assigned labels
-        label_assignments = self.assign_labels_to_workers(labels_per_worker=1)
+        label_assignments = self.assign_labels_to_workers(labels_per_worker=self.labels_per_worker)
         all_assigned_labels = set(l for labels in label_assignments.values() for l in labels)
 
         print(f"Training only on labels: {sorted(all_assigned_labels)}")
@@ -296,9 +305,20 @@ class TopologyProvider:
             print(f"Epoch [{epoch+1}/10], Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
 
         # Save the model after training
-        torch.save(model.state_dict(), '/tmp/trained_model.pth')
+        save_dir = "/tmp/torch_cache"
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, "trained_model.pth")
+        torch.save(model.state_dict(), save_path)
 
         return model
+
+    def prepare_models_for_labels_per_worker(self, labels_per_worker):
+        """Retrain the provider model for a specific labels_per_worker value and build host assignments."""
+        self.labels_per_worker = labels_per_worker
+        self.dnn_model = self.load_dnn_model(max_samples=20)
+        label_map = self.assign_labels_to_workers(labels_per_worker=labels_per_worker)
+        host_models = {worker_name: self.dnn_model for worker_name in label_map}
+        return label_map, host_models
 
     def get_trained_model(self):
         """Return the trained model for use by each host."""
@@ -314,7 +334,7 @@ class TopologyProvider:
 
     def load_cifar_data(self):
         """Load the CIFAR-10 dataset."""
-        cifar_data = datasets.CIFAR10(root='/home/skb67/sim_fed_dht/data', train=True, download=True, transform=self.get_transform())
+        cifar_data = datasets.CIFAR10(root='/home/skb67/sim_fed_dht/data', train=False, download=False, transform=self.get_transform())
         return DataLoader(cifar_data, batch_size=4, shuffle=True)
 
     def add_switch(self):
@@ -340,11 +360,45 @@ class TopologyProvider:
         return host
 
 
+    def _is_port_in_use(self, port, host="0.0.0.0"):
+        """Check if a TCP port is already in use."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            return sock.connect_ex((host, port)) == 0
+
+    def _find_free_controller_port(self, start_port=6653, max_tries=100):
+        """Find an available controller port to avoid collisions."""
+        for port in range(start_port, start_port + max_tries):
+            if not self._is_port_in_use(port):
+                return port
+        raise RuntimeError("No free controller port found for Mininet")
+
+    def _run_mininet_cleanup(self):
+        """Best-effort Mininet cleanup that never aborts the simulation."""
+        # Silence known permission-noise from Mininet cleanup (e.g., ~/.ssh/mn/*).
+        stderr_fd = os.dup(2)
+        try:
+            with open(os.devnull, "w", encoding="utf-8") as devnull:
+                os.dup2(devnull.fileno(), 2)
+                mininet_cleanup()
+        except Exception as e:
+            print(f"⚠️ Mininet cleanup skipped: {e}")
+        finally:
+            os.dup2(stderr_fd, 2)
+            os.close(stderr_fd)
+
+
     def setup(self):
         """Set up the Mininet network and hosts."""
         print("🚀 Starting Mininet Setup...")
+        self._run_mininet_cleanup()
+
+        controller_port = self._find_free_controller_port()
+        print(f"🎛️ Using controller port {controller_port}")
+
         self.net = Mininet(controller=OVSController, switch=OVSSwitch, link=TCLink, autoSetMacs=True)
-        self.net.addController("c0")
+        self.net.addController("c0", port=controller_port)
+
 
         # Create multiple switches for logical groups (e.g., 3 groups)
         num_switches = min(5, self.num_workers)  # Ensure not more switches than workers
@@ -395,6 +449,14 @@ class TopologyProvider:
         # Initialize
         self.failed_nodes_per_switch = {switch.name: [] for switch in self.net.switches}
 
+    def assign_models_to_hosts(self, host_models):
+        """Assign the prepared model(s) to the Mininet hosts."""
+        if not self.net:
+            raise ValueError("Mininet instance is not initialized. Call setup() first.")
+
+        default_model = self.topology_provider.get_trained_model() if self.topology_provider else self.dnn_model
+        for host in self.net.hosts:
+            host.dnn_model = host_models.get(host.name, default_model)
 
     def simulate_unavailability(self, failure_rate=0):
         """Simulate unavailability of workers."""
@@ -521,7 +583,7 @@ class TopologyProvider:
 
 
     def extract_availability_vectors(self):
-         traces = self.load_availability_traces("./traces/traces.txt")
+         traces = self.load_availability_traces("./traces.txt")
          def extract_vector(trace, length=100):
            wifi, charging = False, False
            vector = []
@@ -552,9 +614,10 @@ class TopologyProvider:
        print("corr_threshold: ", corr_threshold)
        print("fail_prob: ", fail_prob)
 
-       # Compute correlation matrix
+       # Compute correlation matrix safely to avoid warnings for empty/constant traces
        device_ids = list(availability_vectors.keys())
        matrix = np.corrcoef([availability_vectors[d] for d in device_ids])
+
 
        # Simulate failures: consider both own availability and correlations
        for i, device_i in enumerate(device_ids):
@@ -594,7 +657,7 @@ class TopologyProvider:
           
        # ✅ Active hosts = not failed
        active_hosts = [h for h in self.net.hosts if h.name not in self.failed_nodes]
-       print(f"\n✅ Active Hosts at timestep {timestep}: {[h.name for h in active_hosts]}")
+       #print(f"\n✅ Active Hosts at timestep {timestep}: {[h.name for h in active_hosts]}")
        print(f"❌ Failed Hosts: {self.failed_nodes}")
 
 
@@ -608,7 +671,8 @@ class TopologyProvider:
         fail_prob=0.3,
         failure_mode="random",
         label_map=None,
-        num_trials=1,
+        num_trials=5,
+        return_details=False,
     ):
        """Evaluate classification accuracy using available hosts."""
        print("🔎 Starting Failure Simulation: Mode =", failure_mode)
@@ -617,6 +681,7 @@ class TopologyProvider:
            raise ValueError("num_trials must be >= 1")
 
        trial_accuracies = []
+       trial_details = []
 
        for trial in range(num_trials):
            print(f"\n🧪 Trial {trial + 1}/{num_trials}")
@@ -633,11 +698,20 @@ class TopologyProvider:
            if not active_hosts:
                print("⚠️ All nodes failed. Cannot evaluate.")
                trial_accuracies.append(0.0)
+               trial_details.append({
+                   "accuracy": 0.0,
+                   "active_host_count": 0,
+                   "failed_host_count": len(self.failed_nodes),
+                   "missing_labels": list(range(10)),
+                   "per_client_accuracy": {},
+                   "per_class_accuracy": {},
+               })
                continue
 
            # Evaluate model accuracy with respect to class presence
-           accuracy = self.evaluate_accuracy(active_hosts, self.sample_images, label_map)
-           trial_accuracies.append(accuracy)
+           result = self.evaluate_accuracy(active_hosts, self.sample_images, label_map)
+           trial_accuracies.append(result["accuracy"])
+           trial_details.append(result)
 
        mean_accuracy = float(np.mean(trial_accuracies)) if trial_accuracies else 0.0
        std_accuracy = float(np.std(trial_accuracies)) if trial_accuracies else 0.0
@@ -645,13 +719,49 @@ class TopologyProvider:
            f"📊 Averaged System Accuracy over {num_trials} trial(s): "
            f"{mean_accuracy:.2f}% ± {std_accuracy:.2f}"
        )
-       return mean_accuracy
+       if not return_details:
+           return mean_accuracy
+
+       averaged_missing_labels = sorted({
+           label
+           for detail in trial_details
+           for label in detail["missing_labels"]
+       })
+       missing_label_rates = {
+           label: sum(label in detail["missing_labels"] for detail in trial_details) / len(trial_details)
+           for label in range(10)
+       } if trial_details else {label: 0.0 for label in range(10)}
+
+       def average_metric(details, key):
+           aggregated = defaultdict(list)
+           for detail in details:
+               for metric_key, value in detail[key].items():
+                   aggregated[str(metric_key)].append(value)
+           return {metric_key: float(np.mean(values)) for metric_key, values in aggregated.items()}
+
+       return {
+           "mean_accuracy": mean_accuracy,
+           "std_accuracy": std_accuracy,
+           "avg_active_host_count": float(np.mean([detail["active_host_count"] for detail in trial_details])) if trial_details else 0.0,
+           "avg_failed_host_count": float(np.mean([detail["failed_host_count"] for detail in trial_details])) if trial_details else 0.0,
+           "averaged_missing_labels": averaged_missing_labels,
+           "missing_label_rates": missing_label_rates,
+           "averaged_per_client_accuracy": average_metric(trial_details, "per_client_accuracy"),
+           "averaged_per_class_accuracy": average_metric(trial_details, "per_class_accuracy"),
+       }
 
 
     def evaluate_accuracy(self, active_hosts, sample_images, label_map):
       if not active_hosts:
         print("⚠️ All nodes failed. Cannot evaluate.")
-        return 0.0
+        return {
+            "accuracy": 0.0,
+            "active_host_count": 0,
+            "failed_host_count": len(self.failed_nodes),
+            "missing_labels": list(range(10)),
+            "per_client_accuracy": {},
+            "per_class_accuracy": {},
+        }
 
       correct_predictions = 0
       total_predictions = 0
@@ -659,7 +769,8 @@ class TopologyProvider:
       class_coverage = set()  # Classes available in current round
       class_counts = defaultdict(int)  # How many times each class appears
       class_correct = defaultdict(int)  # How many times each class is predicted correctly
-      class_missed_by_unavailable = set()
+      host_counts = defaultdict(int)
+      host_correct = defaultdict(int)
 
       with torch.no_grad():
 #        for host, (image, label) in zip(active_hosts, self.sample_images):
@@ -687,9 +798,11 @@ class TopologyProvider:
 
           if label_val in assigned_classes:
             class_counts[label_val] += 1
+            host_counts[host.name] += 1
             if pred_val == label_val:
               correct_predictions += 1
               class_correct[label_val] += 1
+              host_correct[host.name] += 1
             total_predictions += 1
           else:
             print(f"⚠️ Host {host.name} evaluated label {label_val} not in its assigned classes {assigned_classes}")
@@ -704,18 +817,35 @@ class TopologyProvider:
       print(f"❌ Missing label classes due to failure: {sorted(missing_classes)}")
 
       # Report per-class accuracy
+      per_class_accuracy = {}
       print("\n📈 Per-Class Accuracy (for present classes):")
       for c in sorted(class_counts.keys()):
         acc = 100 * class_correct[c] / class_counts[c]
+        per_class_accuracy[str(c)] = acc
         print(f"  Class {c}: {acc:.2f}% ({class_correct[c]}/{class_counts[c]})")
 
-      return accuracy
+      per_client_accuracy = {
+          host_name: (100 * host_correct[host_name] / host_counts[host_name])
+          for host_name in sorted(host_counts.keys())
+          if host_counts[host_name] > 0
+      }
 
+      return {
+          "accuracy": accuracy,
+          "active_host_count": len(active_hosts),
+          "failed_host_count": len(self.failed_nodes),
+          "missing_labels": sorted(missing_classes),
+          "per_client_accuracy": per_client_accuracy,
+          "per_class_accuracy": per_class_accuracy,
+      }
 
     def cleanup(self):
         """Clean up the network."""
-        self.net.stop()
+        if self.net is not None:
+            self.net.stop()
+        self._run_mininet_cleanup()
         print("🧹 Network stopped and cleaned up.")
+
 
 if __name__ == "__main__":
     topology_provider = TopologyProvider(
@@ -731,7 +861,7 @@ if __name__ == "__main__":
         model_name='resnet',
         num_epochs=0,
         failure_probability=0,
-        corr_failure_probability=0.3,
+        corr_failure_probability=0,
         topology_provider = topology_provider
     )  
     topology.setup()
@@ -740,32 +870,133 @@ if __name__ == "__main__":
     fail_probs = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
     num_trials = 5
     availability_vectors = topology.extract_availability_vectors()
-    label_map = topology.assign_labels_to_workers(labels_per_worker=1)
-    row1 = []
-    row2 = []
+    label_options = [1, 5, 10]
+    all_experiments = []
 
-    for fp in fail_probs:
-        acc = topology.simulate_failures(
-            availability_vectors,
-            corr_threshold=0.6,
-            fail_prob=fp,
-            failure_mode="random",  # or "random" or "correlated"
-            label_map=label_map,
-            num_trials=num_trials,
-        )
-        row1.append(acc)
-    print(f"Running averaged accuracies for fail_prob with {num_trials} trials", row1)
-     
-    for corr_th in corr_thresholds:
-        acc = topology.simulate_failures(
-            availability_vectors,
-            corr_threshold=corr_th,
-            fail_prob=0.1,
-            failure_mode="correlated",  # or "random" or "correlated"
-            label_map = label_map,
-            num_trials=num_trials,
-        )
-        row2.append(acc)
-    print(f"Running averaged accuracies for corr_thresholds with {num_trials} trials", row2)
+    for labels_per_worker in label_options:
+        print(f"\n🧪 Running experiments with labels_per_worker={labels_per_worker}")
+        label_map, host_models = topology_provider.prepare_models_for_labels_per_worker(labels_per_worker)
+        topology.assign_models_to_hosts(host_models)
 
+        row1 = []
+        row2 = []
+        random_mode_results = []
+        correlated_mode_results = []
+
+        for fp in fail_probs:
+            result = topology.simulate_failures(
+                availability_vectors,
+                corr_threshold=0.6,
+                fail_prob=fp,
+                failure_mode="random",
+                label_map=label_map,
+                num_trials=num_trials,
+                return_details=True,
+            )
+            row1.append(result["mean_accuracy"])
+            random_mode_results.append({
+                "fail_prob": fp,
+                **result,
+            })
+        print(
+            f"Running averaged accuracies for fail_prob with {num_trials} trials "
+            f"(labels_per_worker={labels_per_worker})",
+            row1,
+        )
+        for corr_th in corr_thresholds:
+            result = topology.simulate_failures(
+                availability_vectors,
+                corr_threshold=corr_th,
+                fail_prob=0.1,
+                failure_mode="correlated",
+                label_map=label_map,
+                num_trials=num_trials,
+                return_details=True,
+            )
+            row2.append(result["mean_accuracy"])
+            correlated_mode_results.append({
+                "corr_threshold": corr_th,
+                **result,
+            })
+        print(
+            f"Running averaged accuracies for corr_thresholds with {num_trials} trials "
+            f"(labels_per_worker={labels_per_worker})",
+            row2,
+        )
+
+        all_experiments.append({
+            "labels_per_worker": labels_per_worker,
+            "random_mode_avg_accuracy": row1,
+            "correlated_mode_avg_accuracy": row2,
+            "random_mode_results": random_mode_results,
+            "correlated_mode_results": correlated_mode_results,
+        })
+
+    output_path = Path("/tmp/failure_simulation_results.json")
+
+    results_payload = {
+        "num_trials": num_trials,
+        "fail_probs": fail_probs,
+        "corr_thresholds": corr_thresholds,
+        "experiments": all_experiments,
+    }
+
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(results_payload, f, indent=2)
+
+    csv_path = Path("/tmp/failure_simulation_results.csv")
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "labels_per_worker",
+            "mode",
+            "parameter_name",
+            "parameter_value",
+            "mean_accuracy",
+            "std_accuracy",
+            "avg_active_host_count",
+            "avg_failed_host_count",
+            "averaged_missing_labels",
+            "missing_label_rates",
+            "averaged_per_client_accuracy",
+            "averaged_per_class_accuracy",
+        ])
+
+        for exp in all_experiments:
+            experiment_labels_per_worker = exp["labels_per_worker"]
+
+            for result in exp["random_mode_results"]:
+                writer.writerow([
+                    experiment_labels_per_worker,
+                    "random",
+                    "fail_prob",
+                    result["fail_prob"],
+                    result["mean_accuracy"],
+                    result["std_accuracy"],
+                    result["avg_active_host_count"],
+                    result["avg_failed_host_count"],
+                    json.dumps(result["averaged_missing_labels"]),
+                    json.dumps(result["missing_label_rates"]),
+                    json.dumps(result["averaged_per_client_accuracy"]),
+                    json.dumps(result["averaged_per_class_accuracy"]),
+                ])
+
+            for result in exp["correlated_mode_results"]:
+                writer.writerow([
+                    experiment_labels_per_worker,
+                    "correlated",
+                    "corr_threshold",
+                    result["corr_threshold"],
+                    result["mean_accuracy"],
+                    result["std_accuracy"],
+                    result["avg_active_host_count"],
+                    result["avg_failed_host_count"],
+                    json.dumps(result["averaged_missing_labels"]),
+                    json.dumps(result["missing_label_rates"]),
+                    json.dumps(result["averaged_per_client_accuracy"]),
+                    json.dumps(result["averaged_per_class_accuracy"]),
+                ])
+
+    print(f"💾 Saved simulation results to {output_path}")
+    print(f"💾 Saved simulation results to {csv_path}")
     topology.cleanup()
