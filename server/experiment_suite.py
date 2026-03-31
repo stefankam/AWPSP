@@ -7,6 +7,11 @@ Runs matrix over:
 - selectors in {awpsp, random, availability_only, oort}
 - seeds (default 5)
 - correlation noise in {0,10,20,40}
+- latency failure threshold in {80,90}
+- communication availability weight in {0.75,1.0}
+- computation availability weight in {0.75,1.0}
+- recovery probability in {0.5,1.0}
+- correlation penalty in {0.5,1.0}
 
 It launches main_server.py with env overrides and stores summarized outputs.
 """
@@ -109,17 +114,24 @@ def run_case(env_overrides, run_tag):
 
 def run_suite():
     print(f"[suite] ROOT={ROOT} MAIN_SERVER={MAIN_SERVER}", flush=True)
-    populations = [100, 300, 1000, 3000]
+    populations = [100]
     selections = [10]
     split_modes = ["overlap"]
-    labels_per_client_options = [2,5,10]
+    labels_per_client_options = [2]
     selectors = ["awpsp"]
     noises = [0]
+    latency_thresholds = [90]
+    comm_availability_weights = [0.75]
+    comp_availability_weights = [0.75]
+    recovery_probabilities = [0.5]
+    correlation_penalties = [0.5]
     seeds = [0]
 
     rows = []
     result_fields = [
-        "N", "m", "split_mode", "labels_per_client", "selector",  "noise_pct", "seed",
+        "N", "m", "split_mode", "labels_per_client", "selector",  "noise_pct",
+        "latency_failure_threshold", "comm_availability_weight", "comp_availability_weight",
+        "recovery_probability", "correlation_penalty", "seed",
         "return_code", "awpsp_accuracy_last", "stdout_tail", "stderr_tail",
         "metrics_path", "final_metrics_path"
     ]
@@ -127,7 +139,12 @@ def run_suite():
         writer = csv.DictWriter(f, fieldnames=result_fields)
         writer.writeheader()
 
-    total = len(populations) * len(selections) * len(split_modes) * len(labels_per_client_options) * len(selectors) * len(noises) * len(seeds)
+    total = (
+        len(populations) * len(selections) * len(split_modes) * len(labels_per_client_options)
+        * len(selectors) * len(noises) * len(latency_thresholds)
+        * len(comm_availability_weights) * len(comp_availability_weights)
+        * len(recovery_probabilities) * len(correlation_penalties) * len(seeds)
+    )
     done = 0
     for n in populations:
         for m in selections:
@@ -135,55 +152,92 @@ def run_suite():
                 for labels_per_client in labels_per_client_options:
                     for selector in selectors:
                         for noise in noises:
-                            for seed in seeds:
-                                run_tag = f"N{n}_m{m}_{split}_labels{labels_per_client}_{selector}_noise{noise}_seed{seed}"
-                                code, acc, out_tail, err_tail, metrics_path, final_path = run_case(
-                                    {
-                                        "LOGICAL_CLIENT_COUNT": n,
-                                        "LOGICAL_SELECTED_PER_ROUND": m,
-                                        "LOGICAL_LABELS_PER_CLIENT": labels_per_client,
-                                        "PHYSICAL_CONTAINER_LIMIT": 10,
-                                        "LOGICAL_SPLIT_MODE": split,
-                                        "SELECTOR_MODE": selector,
-                                        "CORRELATION_NOISE_PCT": noise,
-                                        "EXPERIMENT_SEED": seed,
-                                        "NUM_ROUNDS": 50,
-                                        "USE_LOGICAL_SCHEDULING": True,
-                                    },
-                                    run_tag,
-                                )
-                                done += 1
-                                print(f"[suite] {done}/{total} N={n} m={m} split={split} labels={labels_per_client} selector={selector} noise={noise} seed={seed} rc={code} acc={acc}", flush=True)
-                                row = {
-                                    "N": n,
-                                    "m": m,
-                                    "split_mode": split,
-                                    "labels_per_client": labels_per_client,
-                                    "selector": selector,
-                                    "noise_pct": noise,
-                                    "seed": seed,
-                                    "return_code": code,
-                                    "awpsp_accuracy_last": acc,
-                                    "stdout_tail": out_tail.replace("\n", "\\n"),
-                                    "stderr_tail": err_tail.replace("\n", "\\n"),
-                                    "metrics_path": metrics_path,
-                                    "final_metrics_path": final_path,
-                                }
-                                rows.append(row)
-                                with OUT.open("a", newline="") as f:
-                                    writer = csv.DictWriter(f, fieldnames=result_fields)
-                                    writer.writerow(row)
-
+                            for latency_threshold in latency_thresholds:
+                                for comm_weight in comm_availability_weights:
+                                    for comp_weight in comp_availability_weights:
+                                        for recovery_probability in recovery_probabilities:
+                                            for correlation_penalty in correlation_penalties:
+                                                for seed in seeds:
+                                                    run_tag = (
+                                                        f"N{n}_m{m}_{split}_labels{labels_per_client}_{selector}"
+                                                        f"_noise{noise}_lat{latency_threshold}"
+                                                        f"_cw{comm_weight}_pw{comp_weight}"
+                                                        f"_rp{recovery_probability}_cp{correlation_penalty}_seed{seed}"
+                                                    )
+                                                    code, acc, out_tail, err_tail, metrics_path, final_path = run_case(
+                                                        {
+                                                            "LOGICAL_CLIENT_COUNT": n,
+                                                            "LOGICAL_SELECTED_PER_ROUND": m,
+                                                            "LOGICAL_LABELS_PER_CLIENT": labels_per_client,
+                                                            "PHYSICAL_CONTAINER_LIMIT": 10,
+                                                            "LOGICAL_SPLIT_MODE": split,
+                                                            "SELECTOR_MODE": selector,
+                                                            "CORRELATION_NOISE_PCT": noise,
+                                                            "LATENCY_FAILURE_THRESHOLD": latency_threshold,
+                                                            "COMM_AVAILABILITY_WEIGHT": comm_weight,
+                                                            "COMP_AVAILABILITY_WEIGHT": comp_weight,
+                                                            "RECOVERY_PROBABILITY": recovery_probability,
+                                                            "CORRELATION_PENALTY": correlation_penalty,
+                                                            "EXPERIMENT_SEED": seed,
+                                                            "NUM_ROUNDS": 50,
+                                                            "USE_LOGICAL_SCHEDULING": True,
+                                                        },
+                                                        run_tag,
+                                                    )
+                                                    done += 1
+                                                    print(
+                                                        f"[suite] {done}/{total} N={n} m={m} split={split} labels={labels_per_client} "
+                                                        f"selector={selector} noise={noise} latency_threshold={latency_threshold} "
+                                                        f"comm_weight={comm_weight} comp_weight={comp_weight} "
+                                                        f"recovery_probability={recovery_probability} correlation_penalty={correlation_penalty} "
+                                                        f"seed={seed} rc={code} acc={acc}",
+                                                        flush=True,
+                                                    )
+                                                    row = {
+                                                        "N": n,
+                                                        "m": m,
+                                                        "split_mode": split,
+                                                        "labels_per_client": labels_per_client,
+                                                        "selector": selector,
+                                                        "noise_pct": noise,
+                                                        "latency_failure_threshold": latency_threshold,
+                                                        "comm_availability_weight": comm_weight,
+                                                        "comp_availability_weight": comp_weight,
+                                                        "recovery_probability": recovery_probability,
+                                                        "correlation_penalty": correlation_penalty,
+                                                        "seed": seed,
+                                                        "return_code": code,
+                                                        "awpsp_accuracy_last": acc,
+                                                        "stdout_tail": out_tail.replace("\n", "\\n"),
+                                                        "stderr_tail": err_tail.replace("\n", "\\n"),
+                                                        "metrics_path": metrics_path,
+                                                        "final_metrics_path": final_path,
+                                                    }
+                                                    rows.append(row)
+                                                    with OUT.open("a", newline="") as f:
+                                                        writer = csv.DictWriter(f, fieldnames=result_fields)
+                                                        writer.writerow(row)
     grouped = {}
     for r in rows:
-        key = (r["N"], r["m"], r["split_mode"], r["labels_per_client"], r["selector"], r["noise_pct"])
+        key = (
+            r["N"], r["m"], r["split_mode"], r["labels_per_client"], r["selector"], r["noise_pct"],
+            r["latency_failure_threshold"], r["comm_availability_weight"], r["comp_availability_weight"],
+            r["recovery_probability"], r["correlation_penalty"]
+        )
         grouped.setdefault(key, []).append(r["awpsp_accuracy_last"])
 
     with SUMMARY.open("w", newline="") as f:
-        fieldnames = ["N", "m", "split_mode", "labels_per_client", "selector", "noise_pct", "mean_awpsp_last", "ci95"]
+        fieldnames = [
+            "N", "m", "split_mode", "labels_per_client", "selector", "noise_pct",
+            "latency_failure_threshold", "comm_availability_weight", "comp_availability_weight",
+            "recovery_probability", "correlation_penalty", "mean_awpsp_last", "ci95"
+        ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for (n, m, split, labels_per_client, selector, noise), vals in grouped.items():
+        for (
+            n, m, split, labels_per_client, selector, noise, latency_threshold,
+            comm_weight, comp_weight, recovery_probability, correlation_penalty
+        ), vals in grouped.items():
             clean = [v for v in vals if isinstance(v, (float, int))]
             mean, ci = confidence_interval(clean)
             writer.writerow(
@@ -194,6 +248,11 @@ def run_suite():
                     "labels_per_client": labels_per_client,
                     "selector": selector,
                     "noise_pct": noise,
+                    "latency_failure_threshold": latency_threshold,
+                    "comm_availability_weight": comm_weight,
+                    "comp_availability_weight": comp_weight,
+                    "recovery_probability": recovery_probability,
+                    "correlation_penalty": correlation_penalty,
                     "mean_awpsp_last": mean,
                     "ci95": ci,
                 }

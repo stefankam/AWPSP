@@ -98,6 +98,11 @@ class TopologyProvider:
         self.probation_rounds = {}    # when node first recovered
         self.recovery_threshold = 4   # rounds to wait before marking as recovered
         self.probation_duration = 3   # rounds to weight updates less
+        self.latency_failure_threshold = float(os.getenv("LATENCY_FAILURE_THRESHOLD", "90"))
+        self.packet_loss_failure_threshold = float(os.getenv("PACKET_LOSS_FAILURE_THRESHOLD", "40"))
+        self.recovery_probability = float(os.getenv("RECOVERY_PROBABILITY", "1.0"))
+        self.comm_availability_weight = float(os.getenv("COMM_AVAILABILITY_WEIGHT", "1.0"))
+        self.comp_availability_weight = float(os.getenv("COMP_AVAILABILITY_WEIGHT", "1.0"))
         self.logical_labels_per_client = int(os.getenv("LOGICAL_LABELS_PER_CLIENT", "2"))
 
 
@@ -539,14 +544,18 @@ class TopologyProvider:
             latency = metadata.get("latency")
             loss = metadata.get("packet_loss")
             if latency is not None and loss is not None:
-               if latency > 90 or loss >= 40:
+               if latency > self.latency_failure_threshold or loss >= self.packet_loss_failure_threshold:
                   if node not in self.failed_nodes:
                      print(f"❌ Node {node} failed: latency={latency}, loss={loss}")
                      self.failed_nodes.append(node)
                else:
                   # increment recovery counter
                   self.recovery_counters[node] = self.recovery_counters.get(node, 0) + 1
-                  if node in self.failed_nodes and self.recovery_counters[node] >= self.recovery_threshold:
+                  if (
+                      node in self.failed_nodes
+                      and self.recovery_counters[node] >= self.recovery_threshold
+                      and random.random() <= self.recovery_probability
+                  ):
                      print(f"   ^|^e Node {node} recovered after {self.recovery_counters[node]} healthy rounds")
                      self.failed_nodes.remove(node)
 
@@ -1050,11 +1059,20 @@ class TopologyProvider:
         scores = []
         for node, meta in self.dht.table.items():
             if node in active_hosts:
-               availability = meta["availability"]
+               availability = float(meta.get("availability", 0.0) or 0.0)
                print("availability: ", availability)
                freshness = self.get_freshness(node, current_round)
                print("freshness: ", freshness)
-               score = availability * freshness
+               packet_loss = float(meta.get("packet_loss", 0.0) or 0.0)
+               latency = float(meta.get("latency", 0.0) or 0.0)
+               communication_availability = max(0.0, 1.0 - (packet_loss / 100.0))
+               computation_availability = 1.0 / (1.0 + max(0.0, latency) / 100.0)
+               score = (
+                   (availability ** self.comm_availability_weight)
+                   * (communication_availability ** self.comm_availability_weight)
+                   * (computation_availability ** self.comp_availability_weight)
+                   * freshness
+               )
                scores.append((node, score))
     
         # 3. Sort by score descending

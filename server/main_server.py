@@ -311,6 +311,21 @@ def apply_correlation_noise(correlated_failures, node_pool, noise_pct=0.0, seed=
     return noisy
 
 
+def apply_correlation_penalty(correlated_failures, penalty=1.0, seed=0):
+    penalty = max(0.0, min(1.0, float(penalty)))
+    if penalty >= 1.0 or not correlated_failures:
+        return correlated_failures
+    if penalty <= 0.0:
+        return []
+
+    rng = random.Random(seed)
+    kept = []
+    for pair in correlated_failures:
+        if rng.random() <= penalty:
+            kept.append(pair)
+    return kept
+
+
 
 def build_oort_args():
     return SimpleNamespace(
@@ -351,6 +366,7 @@ def run_federated_training():
     dirichlet_alpha = _env_float("DIRICHLET_ALPHA", 0.5)
     selector_mode = os.getenv("SELECTOR_MODE", "awpsp").lower()
     corr_noise_pct = _env_float("CORRELATION_NOISE_PCT", 0.0)
+    correlation_penalty = _env_float("CORRELATION_PENALTY", 1.0)
 
     experiment_context = {
         "logical_population": logical_client_count,
@@ -360,6 +376,7 @@ def run_federated_training():
         "dirichlet_alpha": dirichlet_alpha,
         "selector_mode": selector_mode,
         "correlation_noise_pct": corr_noise_pct,
+        "correlation_penalty": correlation_penalty,
         "seed": seed,
     }
     
@@ -719,6 +736,11 @@ def run_federated_training():
             noise_pct=corr_noise_pct,
             seed=seed + current_round,
         )
+        correlated_failures = apply_correlation_penalty(
+            correlated_failures,
+            penalty=correlation_penalty,
+            seed=(seed * 1000) + current_round,
+        )
 
         logical_client_ids = [f"h{i}" for i in range(logical_client_count)]
         physical_ids = list(device_registry.keys())[:physical_container_limit]
@@ -1030,6 +1052,7 @@ def run_federated_training():
             "dirichlet_alpha",
             "selector_mode",
             "correlation_noise_pct",
+            "correlation_penalty",
             "seed",
             "Select_Fair_Accuracy",
             "Select_Fair_variance",
@@ -1091,6 +1114,7 @@ def run_federated_training():
                 experiment_context["dirichlet_alpha"],
                 experiment_context["selector_mode"],
                 experiment_context["correlation_noise_pct"],
+                experiment_context["correlation_penalty"],
                 experiment_context["seed"],
                 accuracy_log[-1][1] if accuracy_log else None,
                 var_u_log[-1][1] if var_u_log else None,
